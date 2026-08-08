@@ -6,6 +6,76 @@ description: Append-only record of ingests, decisions, and maintenance passes.
 
 # Log
 
+## [2026-08-09] decision — request queue + -91 termination
+
+- Added `src/registry.rs`: `RequestRegistry` (RwLock<HashMap> + monotonic
+  `AtomicU64` ids) whose `Entry { id, client, model, path, started, phase,
+  kill: watch::Sender<bool> }` registers in `proxy::handle()` after context
+  parse; Drop guard unregisters on every exit path (scopeguard pattern).
+- Kill switch = `watch` send; checkpoints in the streaming select third
+  branch, the `reserve_slot`/`acquire_model_permit` `on_wait` closures
+  (`*kill.borrow()` bail — a queued kill costs nothing), and a select around
+  `buffered()`'s upstream send. Wire contract: SSE error event
+  `code:"-91"` + `[DONE]` on committed streams; HTTP 400 + same envelope on
+  buffered. `record_request(..,"terminated")` + `nimproxy_terminated_total{by}`.
+- `src/lib.rs`: `AppState.registry`; `GET /api/queue` + `POST
+  /api/queue/terminate` under `require_session` with server-side admin check
+  (403); `/api/dashboard/now` now reports `role` (superuser/admin/user) for
+  sidebar gating. No self-exemption on terminate (requirement).
+- `src/dashboard.html`: Queue sidebar tab (admin-visible), KPI strip, table
+  (age · client chip · model pretty-name · path · phase · terminate button),
+  2s poll while visible, empty/403 states; all dynamic values `esc()`-escaped.
+- Tests: registry unit tests (register/drop/snapshot ordering/terminate
+  hit-miss/kill borrow+changed) and 4 e2e tests (401 gate, 403 non-admin +
+  `role` in now, streaming list+terminate→-91 + 404, buffered kill→400 -91,
+  queued-kill lands on a slot-waiting request). Full suite green: 125 unit +
+  95 e2e. Decision page:
+  [request-queue-and-termination](decisions/request-queue-and-termination.md)
+  + row in `index.md`.
+
+## [2026-08-09] decision — dashboard model catalog view
+
+- Extracted the `/v1/models` cache-check/refresh core in `src/proxy.rs` into
+  a shared `catalog(state, cfg, force)` (cache hit → raw bytes; miss → one
+  rate-limited slot fetch, lock held across the refresh); `models()` became a
+  thin wrapper so `GET /v1/models` behavior (status codes, upstream-body
+  passthrough, `deadline` handling) is unchanged.
+- Added session-gated `GET /api/models` (on the `require_session` layer in
+  `src/lib.rs`): `{models, cached_at, ttl_secs}` parsed from the shared
+  cache, `?refresh=1` bypasses the TTL once (operator Refresh button always
+  points at this surface, never at `/v1/models`).
+- Added the **Catalog** sidebar tab in `src/dashboard.html` (after Overview):
+  freshness tiles, copy-per-id rows reusing `publisher()/chipHtml()/esc()`,
+  empty/error states, quiet 60s re-fetch while open; `krow .logo` CSS added
+  for the row chips. `esc()` covers every dynamic value; ids > 256 chars and
+  missing `id` entries are dropped at ingest.
+- Tests: unit `parse_models` filters (garbage/oversized/missing-id bodies)
+  and e2e `api_models_requires_login_and_rides_the_shared_catalog_cache`
+  (401 unauth, cold fetch once, TTL cache hit, force refresh, shared cache
+  warms `/v1/models`). Added
+  [dashboard-model-catalog](decisions/dashboard-model-catalog.md) +
+  `index.md` row; updated
+  [dashboard](../architecture/dashboard.md).
+
+## [2026-08-09] decision — dual dashboard theme supersedes dark-only
+
+- Rewrote `src/dashboard.html` from a dark-only NVIDIA-green palette to a
+  light-default dual theme: `:root` light tokens, `:root[data-theme="dark"]`
+  dark, auto-follow of `prefers-color-scheme` unless pinned by the new topbar
+  `#theme-toggle` (persisted `np-theme`, applied by an inline `<head>` script
+  to avoid flash).
+- Swapped Space Grotesk / Spline Sans Mono for Inter (UI + `--mono`), keeping
+  the Google Fonts CDN under the unchanged CSP with system-font fallback.
+- Deferenced JS color literals: `MED`/`P95` and the `gGreen`/`gMuted` SVG
+  gradients now resolve `--med`/`--p95` via `css()`/`var(--…)` so charts
+  recolor live on toggle; NVIDIA `#76B900` remains only as a publisher/logo
+  identity constant.
+- Security invariants unchanged (fail-closed auth, `esc()` sinks, strict CSP);
+  the toggle adds an attribute-set `<html>` change and no new sink.
+- Amended [dashboard-operator-console-redesign](decisions/dashboard-operator-console-redesign.md)
+  with a superseding amendment; updated
+  [dashboard](../architecture/dashboard.md) and `index.md`; `cargo build` clean.
+
 ## [2026-07-28] ingest — prepare v0.6.5 maintenance release
 
 - Promoted the accumulated maintenance, dashboard-history corrections, and

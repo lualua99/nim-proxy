@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Request Queue sidebar tab with operator termination**: the dashboard now
+  lists every in-flight request (client · model · path · phase · age) behind
+  a **Queue** tab that only admins see, and admin can terminate any request —
+  including their own — from the row. Backed by a new in-memory registry
+  (`src/registry.rs`, zero persistence, monotonic ids, Drop-guaranteed
+  cleanup) and session-gated `GET /api/queue` + `POST /api/queue/terminate`
+  (server-side admin check; 404 for already-finished ids). A killed request
+  receives error code `-91` "Your request has been terminated by the system"
+  — as an SSE error event on committed streams, or HTTP 400 with the same
+  JSON envelope on buffered ones — so harnesses surface it instead of seeing
+  a dropped socket. `GET /api/dashboard/now` now also reports the caller's
+  `role` so the UI can hide the tab from non-admins (the API still enforces
+  403 server-side).
+- **Model Catalog sidebar tab**: a new **Catalog** view surfaces the upstream
+  NIM `/v1/models` directory (exact ids, copy button, publisher chip, added /
+  owned-by metadata) with cache-freshness header and a manual Refresh.
+  Backed by a session-gated `GET /api/models` that shares the proxy's existing
+  TTL cache and rate-limited refresh path, so the dashboard never refetches
+  the catalog outside the /v1/models cache policy and a forced refresh also
+  warms the harness-facing cache.
+
+### Changed
+
+- The dashboard is now dual-theme: light by default, dark follows
+  `prefers-color-scheme`, with a topbar toggle that pins the choice (persisted
+  in `localStorage` as `np-theme` and applied by an inline `<head>` script so
+  a reload never flashes the wrong theme). This reverses the earlier dark-only
+  palette — see the amendment in
+  [`knowledge/decisions/dashboard-operator-console-redesign.md`](knowledge/decisions/dashboard-operator-console-redesign.md).
+- The dashboard font pair (Space Grotesk / Spline Sans Mono) was replaced by
+  Inter for both UI and numeric text, still loaded from Google Fonts under the
+  unchanged CSP with a system-font fallback.
+- Chart colors in the dashboard are now theme-aware: the renderers emit
+  semantic roles (`--brand`, `--green`/`--amber`/`--red`, `--med`/`--p95`)
+  and both `MED`/`P95` and the `gGreen`/`gMuted` SVG gradients resolve them
+  via `css()`/`var(--…)`, so switching themes recolors every chart live and
+  the JS holds no theme-specific color literals. NVIDIA's brand green
+  (`#76B900`) remains only as a publisher/logo identity constant.
+
 ## [0.6.5] - 2026-07-28
 
 ### Fixed

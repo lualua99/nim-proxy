@@ -115,3 +115,31 @@ Today every analytical tab consumes the typed `/api/dashboard` range contract
 plus `/api/dashboard/now`, shares one following/fixed selection, and computes
 delta chips from that selected server-backed sample window. The old
 `/api/history` transport and browser-owned lifetime mode no longer exist.
+
+## Amendment (2026-08-09 — dual theme and Inter, superseding (b) and (c))
+
+The dark-only and fonts-via-CDN choices above are superseded by a dual-theme,
+font-neutral redesign of `src/dashboard.html`:
+
+- **(b) is reversed: light default + dark.** The `:root` tokens are a light
+  palette by default (page `#f8f9fb`, cards `#ffffff`, indigo accent
+  `#6366F1`); `:root[data-theme="dark"]` carries the dark set. A dark theme
+  follows `prefers-color-scheme` unless the operator pins one via the topbar
+  `#theme-toggle`, persisted in `localStorage` under `np-theme` and applied by
+  an inline `<head>` script (no flash-of-unstyled-content on reload). The
+  toggle shows a sun in dark mode and a moon in light mode.
+- **(c) is replaced: Inter only.** The Space Grotesk / Spline Sans Mono pair
+  is dropped for a single Inter family (UI + numeric via `--mono`), still
+  loaded from Google Fonts under the unchanged CSP with a system-font
+  fallback.
+- **Color roles renamed, JS stays theme-free.** The semantic constants the
+  renderers emit are `--brand` (indigo), `--green`/`--amber`/`--red`
+  (success/rate/error), and `--med`/`--p95` (chart quantiles). `MED`/`P95`
+  and the `gGreen`/`gMuted` SVG gradients now read the theme variables via
+  `css()` / `var(--…)` instead of hardcoded literals, so the JS needs no color
+  literals and switching themes recolors every chart live. NVIDIA brand
+  `#76B900` remains only as a publisher/logo identity constant, not a theme
+  token.
+- **Security invariant unchanged**: still fail-closed auth, `esc()` on every
+  `innerHTML` sink, strict CSP. The theme toggle adds no new sink (attribute
+  set on `<html>`, `textContent`-free).

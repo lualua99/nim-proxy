@@ -6,10 +6,10 @@
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -20,6 +20,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::dispatch::Slot;
 use crate::governor::{self, ModelPermit};
+use crate::registry::Registered;
 use crate::{AppState, Config};
 
 /// Per-request metric labels, resolved once up front.
@@ -597,6 +598,16 @@ pub async fn handle(
         .as_ref()
         .and_then(|v| affinity(v, state.pool().len()));
 
+    // Register in the operator request queue. The entry doubles as the kill
+    // switch: an admin can terminate this request and the client sees error
+    // code -91. The entry lives for exactly this request's lifetime (RAII).
+    let registered: Registered = state.registry.register(
+        ctx.client.clone(),
+        ctx.model.clone(),
+        ctx.path.clone(),
+        "queued",
+    );
+
     // Fingerprint what the harness asked for (generation endpoints only).
     if ctx.path == "/v1/chat/completions" || ctx.path == "/v1/completions" {
         record_shape(&ctx, parsed.as_ref(), wants_stream);
@@ -640,6 +651,7 @@ pub async fn handle(
             inflight_guard,
             request_deadline,
             wait_deadline,
+            registered,
         )
     } else {
         let wait_deadline = wait_deadline(&cfg);
@@ -654,6 +666,7 @@ pub async fn handle(
             body,
             prefer,
             wait_deadline,
+            registered,
         );
         if let Some(deadline) = request_deadline {
             match tokio::time::timeout_at(deadline.0.into(), work).await {
@@ -699,66 +712,84 @@ async fn buffered(
     body: Bytes,
     prefer: Option<usize>,
     deadline: Instant,
+    registered: Registered,
 ) -> Response {
     let _active = crate::dispatch::scopeguard(|| gauge!("nimproxy_active_requests").decrement(1.0));
     gauge!("nimproxy_active_requests").increment(1.0);
-    loop {
-        // Two admission gates: a model-pressure permit (worker concurrency,
-        // held through the whole upstream exchange — dropped on every exit
-        // from this iteration), then an RPM slot.
-        let Ok(_permit) = acquire_model_permit(&state, &cfg, &ctx, deadline, || true).await else {
-            record_request(&ctx, "504");
-            return gateway_timeout(&cfg, state.pool().len());
-        };
-        let Some(slot) = reserve_slot(&state, cfg.heartbeat, deadline, prefer, || true).await
-        else {
-            record_request(&ctx, "504");
-            return gateway_timeout(&cfg, state.pool().len());
-        };
-        let sent_at = Instant::now();
-        // A non-streaming request gets an overall timeout so a stalled body read
-        // can't pin an in-flight slot forever (streaming has no such cap).
-        let resp = match upstream_request(
-            &state.http,
-            &cfg.base_url,
-            &method,
-            &path_query,
-            &headers,
-            &slot.key,
-            &body,
-        )
-        .timeout(cfg.request_timeout)
-        .send()
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(lane = slot.lane, error = %e, "upstream connection error, retrying");
-                bench(&slot, "connect", Duration::from_secs(5));
+    let id = registered.id;
+    let mut kill = registered.kill.clone();
+    let _leave = registered;
+    let term_ctx = ctx.clone();
+    // The paced/retrying loop, so a kill lands even while this request waits
+    // in the governor, the FIFO queue, or an upstream retry backoff.
+    let work = async move {
+        loop {
+            // Two admission gates: a model-pressure permit (worker concurrency,
+            // held through the whole upstream exchange — dropped on every exit
+            // from this iteration), then an RPM slot.
+            let Ok(_permit) = acquire_model_permit(&state, &cfg, &ctx, deadline, || true).await
+            else {
+                record_request(&ctx, "504");
+                return gateway_timeout(&cfg, state.pool().len());
+            };
+            let Some(slot) = reserve_slot(&state, cfg.heartbeat, deadline, prefer, || true).await
+            else {
+                record_request(&ctx, "504");
+                return gateway_timeout(&cfg, state.pool().len());
+            };
+            state.registry.set_phase(id, "upstream");
+            let sent_at = Instant::now();
+            // A non-streaming request gets an overall timeout so a stalled body read
+            // can't pin an in-flight slot forever (streaming has no such cap).
+            let resp = match upstream_request(
+                &state.http,
+                &cfg.base_url,
+                &method,
+                &path_query,
+                &headers,
+                &slot.key,
+                &body,
+            )
+            .timeout(cfg.request_timeout)
+            .send()
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(lane = slot.lane, error = %e, "upstream connection error, retrying");
+                    bench(&slot, "connect", Duration::from_secs(5));
+                    continue;
+                }
+            };
+            if retryable(resp.status()) && Instant::now() < deadline {
+                let status = resp.status();
+                let backoff = backoff_for(&resp);
+                // Sniff the error body: worker exhaustion is model-scoped (shared
+                // across every key), so benching the lane would just burn healthy
+                // key capacity on a failover that cannot help.
+                let detail = resp.text().await.unwrap_or_default();
+                if governor::is_worker_exhausted(&detail) {
+                    state
+                        .governor
+                        .note_exhausted(&ctx.model, cfg.governor.overrides.get(&ctx.model).copied());
+                    continue; // permit drops here; re-admission waits out the drain
+                }
+                tracing::info!(lane = slot.lane, %status, ?backoff, "lane benched, retrying");
+                bench(&slot, status.as_str(), backoff);
                 continue;
             }
-        };
-        if retryable(resp.status()) && Instant::now() < deadline {
-            let status = resp.status();
-            let backoff = backoff_for(&resp);
-            // Sniff the error body: worker exhaustion is model-scoped (shared
-            // across every key), so benching the lane would just burn healthy
-            // key capacity on a failover that cannot help.
-            let detail = resp.text().await.unwrap_or_default();
-            if governor::is_worker_exhausted(&detail) {
-                state
-                    .governor
-                    .note_exhausted(&ctx.model, cfg.governor.overrides.get(&ctx.model).copied());
-                continue; // permit drops here; re-admission waits out the drain
-            }
-            tracing::info!(lane = slot.lane, %status, ?backoff, "lane benched, retrying");
-            bench(&slot, status.as_str(), backoff);
-            continue;
+            histogram!("nimproxy_upstream_seconds", "model" => ctx.model.clone())
+                .record(sent_at.elapsed().as_secs_f64());
+            record_request(&ctx, resp.status().as_str());
+            return relay(resp, &ctx).await;
         }
-        histogram!("nimproxy_upstream_seconds", "model" => ctx.model.clone())
-            .record(sent_at.elapsed().as_secs_f64());
-        record_request(&ctx, resp.status().as_str());
-        return relay(resp, &ctx).await;
+    };
+    if *kill.borrow() {
+        return terminated_response(&term_ctx);
+    }
+    tokio::select! {
+        _ = kill.changed() => terminated_response(&term_ctx),
+        resp = work => resp,
     }
 }
 
@@ -779,6 +810,7 @@ fn streaming(
     inflight_guard: impl Send + 'static,
     request_deadline: Option<RequestDeadline>,
     deadline: Instant,
+    registered: Registered,
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
 
@@ -789,6 +821,11 @@ fn streaming(
         let _active =
             crate::dispatch::scopeguard(|| gauge!("nimproxy_active_requests").decrement(1.0));
         gauge!("nimproxy_active_requests").increment(1.0);
+        // Registry entry (and its kill switch) lives exactly as long as this
+        // task, whichever path it exits by.
+        let id = registered.id;
+        let mut kill = registered.kill.clone();
+        let _leave = registered;
         let deadline_tx = tx.clone();
         let deadline_ctx = ctx.clone();
         let work = async move {
@@ -834,6 +871,7 @@ fn streaming(
                         .await;
                     return;
                 };
+                state.registry.set_phase(id, "upstream");
 
                 let sent_at = Instant::now();
                 let resp = match upstream_request(
@@ -995,8 +1033,23 @@ fn streaming(
                 return;
             }
         };
-        if let Some(request_deadline) = request_deadline {
-            tokio::select! {
+        // Kill switch: a latched signal ends the request with error -91 no
+        // matter where it is — queued for a slot, riding out a retry wait, in
+        // the middle of a stream, or parked on backpressure. `changed()` is
+        // edge-triggered, so the `borrow()` pre-check covers a kill that
+        // landed before this select; any later kill resolves `changed()`
+        // immediately because the value differs from what the receiver saw.
+        if *kill.borrow() {
+            record_request(&deadline_ctx, "terminated");
+            let _ = deadline_tx.try_send(Ok(terminated_sse()));
+            return;
+        }
+        match request_deadline {
+            Some(request_deadline) => tokio::select! {
+                _ = kill.changed() => {
+                    record_request(&deadline_ctx, "terminated");
+                    let _ = deadline_tx.try_send(Ok(terminated_sse()));
+                }
                 _ = tokio::time::sleep_until(request_deadline.0.into()) => {
                     record_deadline(&deadline_ctx);
                     let _ = deadline_tx
@@ -1006,9 +1059,14 @@ fn streaming(
                         )));
                 }
                 _ = work => {}
-            }
-        } else {
-            work.await;
+            },
+            None => tokio::select! {
+                _ = kill.changed() => {
+                    record_request(&deadline_ctx, "terminated");
+                    let _ = deadline_tx.try_send(Ok(terminated_sse()));
+                }
+                _ = work => {}
+            },
         }
     });
 
@@ -1020,25 +1078,74 @@ fn streaming(
         .unwrap()
 }
 
-/// /v1/models, cached so harness catalog polls cost zero rate budget. The
-/// lock is held across the refresh so concurrent misses make one upstream
-/// call (followers see the fresh cache when they get the lock).
+/// /v1/models, cached so harness catalog polls cost zero rate budget.
 async fn models(state: Arc<AppState>, cfg: Arc<Config>) -> Response {
+    match catalog(&state, &cfg, false).await {
+        Ok(cat) => json_response(StatusCode::OK, cat.body),
+        Err(CatalogError::Upstream { status, body }) => json_response(status, body),
+        Err(CatalogError::Unavailable(pool_len)) => gateway_timeout(&cfg, pool_len),
+    }
+}
+
+/// The shared catalog result: the raw upstream body plus cache metadata.
+struct Catalog {
+    body: Bytes,
+    /// Wall-clock time (unix seconds) the cached body was fetched.
+    cached_at: u64,
+    ttl_secs: u64,
+}
+
+enum CatalogError {
+    /// Upstream answered with a non-success status; body is passed along.
+    Upstream { status: StatusCode, body: Bytes },
+    /// Pool saturated or upstream unreachable.
+    Unavailable(usize),
+}
+
+/// Shared model-catalog access for `/v1/models` (client-facing) and
+/// `/api/models` (dashboard-facing). Serves the fresh cache; on a miss (or a
+/// forced refresh) it takes one rate-limited slot to fetch upstream once and
+/// writes the result back. The lock is held across the refresh so concurrent
+/// misses make a single upstream call.
+async fn catalog(
+    state: &Arc<AppState>,
+    cfg: &Config,
+    force: bool,
+) -> Result<Catalog, CatalogError> {
     let mut cache = state.models_cache.lock().await;
-    if let Some((at, body)) = cache.as_ref() {
-        if at.elapsed() < cfg.models_ttl {
-            return json_response(StatusCode::OK, body.clone());
+    if !force {
+        if let Some((at, body)) = cache.as_ref() {
+            if at.elapsed() < cfg.models_ttl {
+                let cached_at = SystemTime::now()
+                    .checked_sub(at.elapsed())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                return Ok(Catalog {
+                    body: body.clone(),
+                    cached_at,
+                    ttl_secs: cfg.models_ttl.as_secs(),
+                });
+            }
         }
     }
     let deadline = Instant::now() + Duration::from_secs(30);
     let Some(slot) = reserve_slot(&state, cfg.heartbeat, deadline, None, || true).await else {
-        return gateway_timeout(&cfg, state.pool().len());
+        return Err(CatalogError::Unavailable(state.pool().len()));
     };
     match fetch_models(&state.http, &cfg.base_url, &slot.key).await {
         Ok(resp) if resp.status().is_success() => {
             let body = resp.bytes().await.unwrap_or_default();
+            let cached_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             *cache = Some((Instant::now(), body.clone()));
-            json_response(StatusCode::OK, body)
+            Ok(Catalog {
+                body,
+                cached_at,
+                ttl_secs: cfg.models_ttl.as_secs(),
+            })
         }
         Ok(resp) => {
             if retryable(resp.status()) {
@@ -1047,13 +1154,85 @@ async fn models(state: Arc<AppState>, cfg: Arc<Config>) -> Response {
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let body = resp.bytes().await.unwrap_or_default();
-            json_response(status, body)
+            Err(CatalogError::Upstream { status, body })
         }
         Err(e) => {
             tracing::warn!(error = %e, "models fetch failed");
-            gateway_timeout(&cfg, state.pool().len())
+            Err(CatalogError::Unavailable(state.pool().len()))
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+pub struct ModelsQuery {
+    refresh: Option<String>,
+}
+
+/// Dashboard catalog: the same cache/refresh path as `/v1/models`, returning
+/// a parseable list plus cache metadata so the UI can show staleness and
+/// offer an operator-triggered refresh (`?refresh=1` skips the TTL once).
+pub async fn api_models(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ModelsQuery>,
+) -> Response {
+    let cfg = state.cfg();
+    let force = query
+        .refresh
+        .as_deref()
+        .is_some_and(|v| v == "1" || v == "true");
+    match catalog(&state, &cfg, force).await {
+        Ok(cat) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "models": parse_models(&cat.body),
+                "cached_at": cat.cached_at,
+                "ttl_secs": cat.ttl_secs,
+            })),
+        )
+            .into_response(),
+        Err(CatalogError::Upstream { status, .. }) => (
+            status,
+            axum::Json(serde_json::json!({
+                "error": {
+                    "message": "upstream models endpoint returned an error",
+                    "type": "proxy_error",
+                    "code": "upstream_error",
+                }
+            })),
+        )
+            .into_response(),
+        Err(CatalogError::Unavailable(_)) => (
+            StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({
+                "error": {
+                    "message": "catalog refresh failed (no upstream slot or unreachable)",
+                    "type": "proxy_error",
+                    "code": "catalog_unavailable",
+                }
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Extract the `data` array from the cached upstream body, keeping only
+/// entries with a usable `id` (the OpenAI-minimal schema guarantees it, but
+/// the body is upstream bytes and is displayed in the dashboard).
+fn parse_models(body: &[u8]) -> Vec<serde_json::Value> {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.get("data").and_then(|d| d.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter(|m| {
+            m.get("id")
+                .and_then(|i| i.as_str())
+                .is_some_and(|s| !s.is_empty() && s.len() <= MODEL_LABEL_CAP)
+        })
+        .cloned()
+        .collect()
 }
 
 /// The raw model-catalog fetch with an explicit key — shared by the cached
@@ -1146,6 +1325,20 @@ fn sse_error(message: &str) -> Bytes {
     sse_error_with_code("upstream_unavailable", message)
 }
 
+/// The operator-kill error contract: code `-91` and this exact message.
+/// Streamed requests already committed to 200 SSE when they were killed, so
+/// the error travels as an in-stream event followed by `[DONE]`.
+fn terminated_sse() -> Bytes {
+    sse_error_with_code("-91", "Your request has been terminated by the system")
+}
+
+/// Buffered form of the same kill: a non-retryable 400 JSON error.
+fn terminated_response(ctx: &Ctx) -> Response {
+    record_request(ctx, "terminated");
+    let body = proxy_error_json("-91", "Your request has been terminated by the system");
+    (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
+}
+
 fn json_response(status: StatusCode, body: Bytes) -> Response {
     Response::builder()
         .status(status)
@@ -1213,8 +1406,8 @@ fn gateway_timeout(cfg: &Config, pool_len: usize) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_label, count_tools, finish_label, is_json_mode, label_path, sanitize_label,
-        tool_choice_mode, SseScan,
+        bounded_label, count_tools, finish_label, is_json_mode, label_path, parse_models,
+        sanitize_label, tool_choice_mode, SseScan,
     };
     use std::collections::HashSet;
 
@@ -1358,6 +1551,36 @@ mod tests {
             &serde_json::json!({"response_format": {"type": "text"}})
         ));
         assert!(!is_json_mode(&serde_json::json!({"model": "x"})));
+    }
+
+    #[test]
+    fn parse_models_keeps_only_id_carrying_entries() {
+        // Entries missing `id`, empty, or with no usable `id` string are dropped;
+        // the well-formed one passes through with all of its fields.
+        let body = br#"{"object":"list","data":[
+            {"id":"meta/llama-3.3-70b","object":"model","created":0,"owned_by":"meta"},
+            {"object":"model","created":1},
+            {"id":"","object":"model"},
+            {"id":42}
+        ]}"#;
+        let out = parse_models(body);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["id"], "meta/llama-3.3-70b");
+        assert_eq!(out[0]["owned_by"], "meta");
+        let out = parse_models(b"not json");
+        assert!(out.is_empty());
+        let out = parse_models(br#"{"data": null}"#);
+        assert!(out.is_empty());
+        let out = parse_models(br#"{"nope": 1}"#);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parse_models_drops_oversized_ids() {
+        // The same 256-char cap as metric model labels: an outsized id would
+        // distort the dashboard list, so it is filtered at ingest.
+        let big = format!(r#"{{"data":[{{"id":"{}"}}]}}"#, "a".repeat(300));
+        assert!(parse_models(big.as_bytes()).is_empty());
     }
 }
 

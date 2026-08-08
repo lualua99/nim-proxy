@@ -28,10 +28,12 @@ the chronology in [log.md](log.md).
 | [auth-posture-and-dashboard-password](decisions/auth-posture-and-dashboard-password.md) | Fail closed without auth; API keys + a shared-password dashboard session |
 | [input-sanitizing-and-xss](decisions/input-sanitizing-and-xss.md) | Sanitize client `model`/`path` labels; escape + CSP the dashboard (XSS/cardinality/log-injection) |
 | [request-shape-metrics](decisions/request-shape-metrics.md) | Capture agent-behavior & quality signal as bounded metrics — counts, never content — for benchmarking |
-| [dashboard-operator-console-redesign](decisions/dashboard-operator-console-redesign.md) | 6→5 tabs (Compare merged in), dark-only palette, webfonts via Google Fonts CDN under CSP, window-halves delta chips |
+| [dashboard-operator-console-redesign](decisions/dashboard-operator-console-redesign.md) | 6→5 tabs (Compare merged in), dual light/dark theme (dark-only superseded), Inter via Google Fonts CDN under CSP, window-halves delta chips |
 | [ui-managed-config-store](decisions/ui-managed-config-store.md) | App config moves from env into a JSON store edited from the dashboard; first-run wizard, multi-user + per-key ownership, no encryption at rest |
 | [explicit-request-deadline](decisions/explicit-request-deadline.md) | Opt-in wall-clock bound cancels queue/retry/generation work without weakening patient defaults |
 | [dependency-update-cooldown](decisions/dependency-update-cooldown.md) | Routine dependency updates wait seven days; security updates remain immediate |
+| [dashboard-model-catalog](decisions/dashboard-model-catalog.md) | A Catalog sidebar tab surfaces the upstream model list via a session-gated /api/models sharing the proxy's TTL cache |
+| [request-queue-and-termination](decisions/request-queue-and-termination.md) | In-memory registry of live requests; admin Queue tab terminates any request with error code -91 |
 
 ## Research — validated external facts
 

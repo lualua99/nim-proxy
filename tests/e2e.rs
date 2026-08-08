@@ -7,6 +7,7 @@
 mod support;
 
 use std::os::unix::fs::PermissionsExt;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use support::{
@@ -591,6 +592,71 @@ async fn models_catalog_is_cached_and_auth_gated() {
             .load(std::sync::atomic::Ordering::SeqCst),
         1,
         "catalog served from cache after first fetch"
+    );
+}
+
+#[tokio::test]
+async fn api_models_requires_login_and_rides_the_shared_catalog_cache() {
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(&mock.url, keyed("alice", "sekrit"), &[]).await;
+
+    // Dashboard session gate: no cookie -> 401 like every other /api route.
+    let unauth = client().get(proxy.url("/api/models")).send().await.unwrap();
+    assert_eq!(unauth.status(), 401);
+
+    let cookie = login(&proxy).await;
+    let get = || client().get(proxy.url("/api/models")).header("cookie", &cookie);
+
+    // Cold cache: the first dashboard fetch triggers one upstream call and
+    // reports the cache metadata.
+    let r = get().send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["models"][0]["id"], "mock/model-a", "{v}");
+    assert!(v["cached_at"].as_u64().unwrap() > 0, "{v}");
+    assert_eq!(v["ttl_secs"], 600, "{v}");
+    assert_eq!(
+        mock.state
+            .models_hits
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "cold catalog fetched upstream exactly once"
+    );
+
+    // Within the TTL: served from cache, no second upstream call.
+    let r = get().send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        mock.state
+            .models_hits
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+
+    // Forced refresh bypasses the TTL once (operator's Refresh button).
+    let r = get().query(&[("refresh", "1")]).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        mock.state
+            .models_hits
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+
+    // The dashboard's catalog write lands in the shared cache: the client-
+    // facing /v1/models now answers from it without a new upstream fetch.
+    let rv1 = client()
+        .get(proxy.url("/v1/models"))
+        .bearer_auth("sekrit")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rv1.status(), 200);
+    assert_eq!(
+        mock.state
+            .models_hits
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
     );
 }
 
@@ -3724,8 +3790,326 @@ async fn health_probe_flag_reports_liveness() {
         run_health(proxy.port.to_string()).success(),
         "--health exits 0 against a healthy proxy"
     );
-    assert!(
+assert!(
         !run_health("1".into()).success(),
         "--health exits non-zero against a dead port"
     );
+}
+
+/// The operator queue lists every in-flight request (client · model · path ·
+/// phase) and a terminate call ends its stream with error code -91 and the
+/// required message. The entry unregisters itself the moment the stream dies.
+#[tokio::test]
+async fn queue_lists_inflight_requests_and_terminates_them_with_code_91() {
+    use futures_util::StreamExt;
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(&mock.url, keyed("alice", "sekrit"), &[]).await;
+    mock.state.push(Behavior::ActiveStream(50));
+    let cookie = login(&proxy).await;
+
+    // Unauthenticated /api/queue is gated like every other /api route.
+    let unauth = client().get(proxy.url("/api/queue")).send().await.unwrap();
+    assert_eq!(unauth.status(), 401);
+
+    // Start a stream that never ends on its own; a background task drains it
+    // into a shared buffer so the proxy's response channel never fills (that
+    // mirrors a harness actually reading its stream).
+    let stream = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .bearer_auth("sekrit")
+        .json(&chat_body("queue probe", true))
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream();
+    let out = Arc::new(Mutex::new(String::new()));
+    {
+        let out = out.clone();
+        tokio::spawn(async move {
+            let mut stream = stream;
+            while let Some(Ok(chunk)) = stream.next().await {
+                out.lock().unwrap().push_str(&String::from_utf8_lossy(&chunk));
+            }
+        });
+    }
+
+    // The queue shows the request with client / model / path.
+    let entry = loop {
+        let v = client()
+            .get(proxy.url("/api/queue"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(v.status(), 200);
+        let q: serde_json::Value = v.json().await.unwrap();
+        if let Some(first) = q["requests"].as_array().and_then(|a| a.first()) {
+            break first.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(entry["client"], "alice");
+    assert_eq!(entry["model"], "mock/model-a");
+    assert_eq!(entry["path"], "/v1/chat/completions");
+    assert!(entry["phase"].is_string(), "{entry}");
+    assert!(entry["age_s"].as_u64().is_some(), "{entry}");
+    let id = entry["id"].as_u64().unwrap();
+
+    // Terminate it: the client's SSE stream must end with error code -91.
+    let r = client()
+        .post(proxy.url("/api/queue/terminate"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({ "id": id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    // The -91 SSE must arrive on the client stream.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let got = loop {
+        let cur = out.lock().unwrap().clone();
+        if cur.contains("\"code\":\"-91\"") {
+            break cur;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "killed stream should carry the -91 error, got: {cur}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        got.contains("Your request has been terminated by the system"),
+        "killed stream should carry the termination message, got: {got}"
+    );
+
+    // The entry is gone from the queue, and an unknown id is a 404.
+    let q: serde_json::Value = loop {
+        let v: serde_json::Value = client()
+            .get(proxy.url("/api/queue"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if v["requests"].as_array().unwrap().is_empty() {
+            break v;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(q["requests"].as_array().unwrap().is_empty(), "{q}");
+    let r = client()
+        .post(proxy.url("/api/queue/terminate"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({ "id": 999_999 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+}
+
+/// The queue surface is admin-only: plain users are denied server-side, and
+/// `/api/dashboard/now` reports the role so the sidebar entry can be hidden.
+#[tokio::test]
+async fn queue_is_admin_only_and_now_reports_the_role() {
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(
+        &mock.url,
+        StoreOpts {
+            extra_users: vec![("carol".into(), "user".into())],
+            ..keyed("alice", "sekrit")
+        },
+        &[],
+    )
+    .await;
+
+    let user_cookie = login_as(&proxy, "carol").await;
+    let get = client()
+        .get(proxy.url("/api/queue"))
+        .header("cookie", &user_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), 403, "plain users must not see the queue");
+    let term = client()
+        .post(proxy.url("/api/queue/terminate"))
+        .header("cookie", &user_cookie)
+        .json(&serde_json::json!({ "id": 1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(term.status(), 403, "plain users must not terminate");
+
+    let admin_cookie = login(&proxy).await;
+    let get = client()
+        .get(proxy.url("/api/queue"))
+        .header("cookie", &admin_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), 200);
+
+    assert_eq!(dashboard_now(&proxy, &user_cookie).await["role"], "user");
+    assert_eq!(dashboard_now(&proxy, &admin_cookie).await["role"], "superuser");
+}
+
+/// A buffered (non-streaming) request killed while waiting on upstream
+/// headers answers the client with a JSON error: HTTP 400, code -91.
+#[tokio::test]
+async fn queue_terminates_buffered_requests_with_a_json_91() {
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(&mock.url, keyed("alice", "sekrit"), &[]).await;
+    mock.state.push(Behavior::DelayHeaders(30_000));
+    let cookie = login(&proxy).await;
+
+    // The buffered request is parked waiting for headers (30s).
+    let url = proxy.url("/v1/chat/completions");
+    let waiting = tokio::spawn(async move {
+        client()
+            .post(url)
+            .bearer_auth("sekrit")
+            .json(&chat_body("buffered queue probe", false))
+            .send()
+            .await
+            .unwrap()
+    });
+    let id = loop {
+        let v = client()
+            .get(proxy.url("/api/queue"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        let q: serde_json::Value = v.json().await.unwrap();
+        if let Some(first) = q["requests"].as_array().and_then(|a| a.first()) {
+            break first["id"].as_u64().unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let r = client()
+        .post(proxy.url("/api/queue/terminate"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({ "id": id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let resp = waiting.await.unwrap();
+    assert_eq!(resp.status(), 400, "buffered kill answers 400, not the 200-body");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "-91", "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("terminated by the system"),
+        "{v}"
+    );
+}
+
+/// A kill also lands on a request still waiting for an RPM slot (phase
+/// "queued" in the queue view) — no slot was reserved for it, so nothing is
+/// wasted, and its stream still ends with the -91 error.
+#[tokio::test]
+async fn queue_terminates_a_request_still_waiting_for_a_slot() {
+    use futures_util::StreamExt;
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(
+        &mock.url,
+        StoreOpts {
+            nim_keys: vec![("test-key-0".into(), 1)],
+            heartbeat_secs: 1,
+            ..keyed("alice", "sekrit")
+        },
+        &[],
+    )
+    .await;
+    mock.state.push(Behavior::ActiveStream(500));
+    mock.state.push(Behavior::Ok);
+    let cookie = login(&proxy).await;
+
+    // Occupy the single lane with a stream that never ends. The holder and
+    // the waiter are both "alice"; the waiter sits in phase "queued".
+    let holder = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .bearer_auth("sekrit")
+        .json(&chat_body("queue holder", true))
+        .send()
+        .await
+        .unwrap();
+    let mut waiter = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .bearer_auth("sekrit")
+        .json(&chat_body("queue waiter", true))
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream();
+    // Read the waiter's stream in the background (heartbeats and, later, the
+    // -91 kill event all flow through it).
+    let reader = tokio::spawn(async move {
+        let mut out = String::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Ok(Some(Ok(chunk))) = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            waiter.next(),
+        )
+        .await
+        {
+            out.push_str(&String::from_utf8_lossy(&chunk));
+            if out.contains("[DONE]") {
+                break;
+            }
+        }
+        out
+    });
+
+    let waiter_id = loop {
+        let v = client()
+            .get(proxy.url("/api/queue"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        let q: serde_json::Value = v.json().await.unwrap();
+        let reqs = q["requests"].as_array().unwrap();
+        if let Some(w) = reqs.iter().find(|r| r["phase"] == "queued") {
+            break w["id"].as_u64().unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let r = client()
+        .post(proxy.url("/api/queue/terminate"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({ "id": waiter_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let out = reader.await.unwrap();
+    assert!(
+        out.contains("\"code\":\"-91\""),
+        "a queued (not yet slotted) request must still die with -91, got: {out}"
+    );
+
+    // The holder is untouched and still listed; the waiter's entry is gone.
+    let q: serde_json::Value = client()
+        .get(proxy.url("/api/queue"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let reqs = q["requests"].as_array().unwrap();
+    assert_eq!(reqs.len(), 1, "{q}");
+    assert_eq!(reqs[0]["phase"], "upstream", "{q}");
+    drop(holder);
 }
