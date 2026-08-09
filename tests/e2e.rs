@@ -4011,9 +4011,9 @@ async fn queue_terminates_buffered_requests_with_a_json_91() {
     );
 }
 
-/// A kill also lands on a request still waiting for an RPM slot (phase
-/// "queued" in the queue view) — no slot was reserved for it, so nothing is
-/// wasted, and its stream still ends with the -91 error.
+/// A kill also lands on a request still waiting for a rate-limit slot (phase
+/// `waiting_slot` in the queue view) — no slot was reserved for it, so nothing
+/// is wasted, and its stream still ends with the -91 error.
 #[tokio::test]
 async fn queue_terminates_a_request_still_waiting_for_a_slot() {
     use futures_util::StreamExt;
@@ -4033,7 +4033,7 @@ async fn queue_terminates_a_request_still_waiting_for_a_slot() {
     let cookie = login(&proxy).await;
 
     // Occupy the single lane with a stream that never ends. The holder and
-    // the waiter are both "alice"; the waiter sits in phase "queued".
+    // the waiter are both "alice"; the waiter sits in phase "waiting_slot".
     let holder = client()
         .post(proxy.url("/v1/chat/completions"))
         .bearer_auth("sekrit")
@@ -4077,7 +4077,7 @@ async fn queue_terminates_a_request_still_waiting_for_a_slot() {
             .unwrap();
         let q: serde_json::Value = v.json().await.unwrap();
         let reqs = q["requests"].as_array().unwrap();
-        if let Some(w) = reqs.iter().find(|r| r["phase"] == "queued") {
+        if let Some(w) = reqs.iter().find(|r| r["phase"] == "waiting_slot") {
             break w["id"].as_u64().unwrap();
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4112,4 +4112,106 @@ async fn queue_terminates_a_request_still_waiting_for_a_slot() {
     assert_eq!(reqs.len(), 1, "{q}");
     assert_eq!(reqs[0]["phase"], "upstream", "{q}");
     drop(holder);
+}
+
+/// The queue view distinguishes the two wait stages: a request blocked on the
+/// governor's worker-concurrency gate shows `waiting_permit`, not
+/// `waiting_slot`.
+#[tokio::test]
+async fn queue_reports_waiting_permit_phase() {
+    use futures_util::StreamExt;
+    let mock = start_mock().await;
+    let proxy = start_proxy(&mock.url, &[]).await;
+    let root = support::login(&proxy).await;
+
+    // Pin the model's concurrency cap to 1: the second request must then wait
+    // on the governor gate (phase waiting_permit), not the RPM queue.
+    let (status, v) = post_json(
+        &proxy,
+        &root,
+        "/api/settings/governor",
+        serde_json::json!({"set_override": {"model": "mock/model-a", "cap": 1}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{v}");
+
+    mock.state.push(Behavior::ActiveStream(500));
+    mock.state.push(Behavior::Ok);
+
+    // First request takes the single permit and streams forever.
+    let holder = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("permit holder", true))
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream();
+    let out = Arc::new(Mutex::new(String::new()));
+    {
+        let out = out.clone();
+        tokio::spawn(async move {
+            let mut holder = holder;
+            while let Some(Ok(chunk)) = holder.next().await {
+                out.lock().unwrap().push_str(&String::from_utf8_lossy(&chunk));
+            }
+        });
+    }
+
+    // Second request: admitted to the slot queue but stalled at the permit.
+    let mut waiter = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("permit waiter", true))
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream();
+    let waiter_out = Arc::new(Mutex::new(String::new()));
+    {
+        let waiter_out = waiter_out.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(chunk)) = waiter.next().await {
+                waiter_out.lock().unwrap().push_str(&String::from_utf8_lossy(&chunk));
+            }
+        });
+    }
+
+    let seen = loop {
+        let v = client()
+            .get(proxy.url("/api/queue"))
+            .header("cookie", &root)
+            .send()
+            .await
+            .unwrap();
+        let q: serde_json::Value = v.json().await.unwrap();
+        let reqs = q["requests"].as_array().unwrap();
+        if let Some(w) = reqs.iter().find(|r| r["model"] == "mock/model-a" && r["phase"] == "waiting_permit") {
+            break w.clone();
+        }
+        assert!(reqs.iter().any(|r| r["phase"] == "upstream"), "holder must be upstream: {q}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let id = seen["id"].as_u64().unwrap();
+    // Don't leave the waiter parked forever: it must die with -91 like any
+    // other queued request.
+    let r = client()
+        .post(proxy.url("/api/queue/terminate"))
+        .header("cookie", &root)
+        .json(&serde_json::json!({ "id": id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let cur = waiter_out.lock().unwrap().clone();
+        if cur.contains("\"code\":\"-91\"") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "permit-waiting kill should carry -91, got: {cur}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

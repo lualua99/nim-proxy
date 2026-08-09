@@ -6,6 +6,53 @@ description: Append-only record of ingests, decisions, and maintenance passes.
 
 # Log
 
+## [2026-08-09] ingest — per-key calibration (measured ceiling)
+
+- `src/pool.rs`: new `Calibration` per lane — a factor on the configured
+  `rpm` learned from upstream rejections (`Pool::observe`, gated on
+  `Signal::RateLimited { retry_after }` vs `Signal::ServerError`); decays ×0.9
+  per event, extra ×0.5 + locked-flag after the 2nd `Retry-After >= 30s`
+  lockout signature (floor 0.1 vs ordinary 0.2; `NIMPROXY_CALIBRATION_PROBE_SECS`
+  gated `maybe_probe` heals +0.01 per silence interval, default 3600s).
+  `try_take`/`reserve` admit on `effective_rpm`; window math uses the effective
+  count. Factor carries across `Pool::rebuild` like the window/cooldown.
+- `src/proxy.rs`: `bench()` now takes `Option<Signal>` — real 429/5xx feed
+  `observe`; connect errors are bench-only. Helpers `retry_after_secs`,
+  `upstream_signal()`; signal captured before `resp.text()` consumption.
+- `src/settings.rs` + dashboard: key rows and lane meters show
+  `in_window / effective` with the ×factor when < 1; per-lane gauge
+  `nimproxy_lane_calibration` republished on shrink/probe.
+- New pool unit tests: `observe_rate_limit_shrinks_admission`,
+  `lockout_signature_cuts_far_below_floor`, `server_error_shrinks_without_lockout`,
+  `rebuild_carries_calibration_for_kept_keys`. All 129 unit + 96 e2e tests pass.
+- Note: rustfmt/clippy unavailable in this toolchain (rustc from system
+  package); manual formatting applied, CI still enforces both.
+
+## [2026-08-09] lint — README dashboard section caught up to the tabs
+
+- README listed only the five analytical tabs and claimed all roles see
+  identical dashboard tabs. Amended: seven persona tabs (Catalog and Queue
+  added, each with a one-liner: catalog = upstream directory + refresh,
+  queue = admin-only in-flight list with `-91` termination and the
+  waiting-slot/permit stage badges); `user` role description now states the
+  Queue tab is admin-only.
+
+## [2026-08-09] ingest — queue wait stages split (waiting_permit/waiting_slot)
+
+- `src/proxy.rs`: registration phase `"queued"` → `"waiting_permit"`; both
+  `buffered()` and `streaming()` now `set_phase(id, "waiting_slot")` before
+  `reserve_slot` and keep `"upstream"` after the slot is won, so the queue
+  view distinguishes the governor gate from the rate-limit FIFO.
+- `src/dashboard.html`: `q-queued` KPI tile split into `q-slot` (rate-limit
+  slot waiters) + `q-permit` (model-capacity waiters); row badge now three-way
+  (waiting · permit / waiting · slot / upstream).
+- Tests: e2e `queue_terminates_a_request_still_waiting_for_a_slot` asserts
+  `waiting_slot`; new `queue_reports_waiting_permit_phase` pins a governor
+  override cap=1 and observes the second request parked at `waiting_permit`
+  then killed with -91.
+- Decision page phase contract updated (`queued/upstream` → three-state);
+  CHANGELOG Unreleased entry.
+
 ## [2026-08-09] decision — request queue + -91 termination
 
 - Added `src/registry.rs`: `RequestRegistry` (RwLock<HashMap> + monotonic

@@ -320,11 +320,16 @@ pub async fn api_config(
 
     // Live lane state, keyed by the key string (enabled keys only).
     let pool = state.pool();
-    let stats: std::collections::HashMap<String, (usize, usize, u64)> = pool
+    let stats: std::collections::HashMap<String, (usize, usize, u64, f64)> = pool
         .lane_stats()
         .into_iter()
         .enumerate()
-        .map(|(lane, s)| (s.key.clone(), (lane, s.in_window, s.cooldown_ms)))
+        .map(|(lane, s)| {
+            (
+                s.key.clone(),
+                (lane, s.in_window, s.cooldown_ms, s.cal_factor),
+            )
+        })
         .collect();
 
     // The padlocked key: the superuser's only enabled key (the pool floor).
@@ -354,9 +359,10 @@ pub async fn api_config(
                 "owner": k.owner,
                 "enabled": k.enabled,
                 "rpm": k.rpm,
-                "lane": lane.map(|(i, _, _)| i),
-                "in_window": lane.map(|(_, w, _)| w),
-                "cooldown_ms": lane.map(|(_, _, c)| c),
+                "lane": lane.map(|(i, _, _, _)| i),
+                "in_window": lane.map(|(_, w, _, _)| w),
+                "cooldown_ms": lane.map(|(_, _, c, _)| c),
+                "cal_factor": lane.map(|(_, _, _, f)| f),
                 "guarded": guarded_key.as_deref() == Some(k.key.as_str()),
             })
         })

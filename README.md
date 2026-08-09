@@ -139,9 +139,11 @@ burns — all from counts and sizes, never message content.
 
 <div align="center"><img src="docs/assets/dashboard-models.png" alt="Models tab" width="850"></div>
 
-Five persona-aligned tabs, each ordered at-a-glance → trends → detail:
+Seven persona-aligned tabs, each ordered at-a-glance → trends → detail:
 
 - **Overview** — the one-screen landing: dollars saved, capacity and success-rate ring gauges, request/token/savings sparklines, a health strip, and top models & harnesses.
+- **Catalog** — the upstream NIM model directory (`/v1/models`): exact ids with a copy button, publisher chip, cache-freshness timestamp, and a manual refresh that warms the harness-facing cache too.
+- **Queue** — *admin-only*: every in-flight request (client · model · path · stage · age) in one list. Each row shows whether it is waiting on the rate-limit queue (`waiting · slot`), waiting on the model-concurrency gate (`waiting · permit`), or already streaming upstream, and an admin can **terminate any request** (their own included) — the client then receives error `-91` "Your request has been terminated by the system".
 - **Models** — ranked model cards, TTFT / generation-speed / inter-token-latency / upstream-latency charts, tokens-per-minute, tool-call volume, truncation and reasoning-share breakdowns, and a head-to-head scorecard.
 - **Clients** — what each agent is *doing*: tool intensity, conversation depth, sampling fingerprint, requested output budget, streaming-vs-buffered mix, and a per-harness leaderboard.
 - **Reliability** — availability against the configured SLO (99.9% by default) with an error budget, requests-by-outcome over time, where time goes (queue / first token / generation), an error taxonomy, an hour-of-day heatmap, and a model-pressure card when the governor engages.
@@ -223,7 +225,7 @@ The wizard creates the **superuser** — an admin that can never be deleted (so 
 
 - **superuser** — an admin; the one account that can't be deleted, and it always owns ≥1 enabled NIM key (the pool floor).
 - **admin** — server settings + user management.
-- **user** — own account, own client API keys, own NIM keys. Sees every dashboard tab (identical for all roles) but only their own key rows.
+- **user** — own account, own client API keys, own NIM keys. Sees the dashboard tabs except **Queue** (admins only; user requests still appear there, just not the tab) and only their own key rows.
 
 That last role is the shared-pool model: a friend adds their NIM key to the pool and mints their own client key; nobody else — not even an admin — can ever see either value.
 

@@ -1,6 +1,6 @@
 # 任务 01：可用模型查看页（Model Catalog）
 
-> 状态：已规划，待实施
+> 状态：已完成（所有实现步骤落地并通过验证，详见文末"实施记录"）
 > 日期：2026-08-09
 > 需求：在 dashboard 侧边栏新增一个"可用模型查看页"，方便操作员了解 NIM 上游当前可用的模型列表。
 
@@ -115,3 +115,24 @@
   避免运维困惑。
 - **缓存的共享**：dashboard 刷新目录也会顺带更新 `/v1/models` 客户端
   缓存（行为一致，无破坏）。
+---
+
+## 实施记录（2026-08-09 完成）
+
+- `src/proxy.rs`：抽出共享 `catalog(state, cfg, force)`（:1110），`models()`
+  （:1083，`/v1/models`）与新增 `api_models()`（:1171，`GET /api/models`）
+  共用同一缓存/刷新路径；响应含 `{models, cached_at, ttl_secs}`；
+  `?refresh=1` 绕过 TTL 强制刷新；刷新失败返回 `502 catalog_unavailable`。
+- `src/lib.rs`：`.route("/api/models", get(...))` 挂于 `require_session` 之下。
+- `src/dashboard.html`：Catalog tab（data-tab="catalog"，Overview 后、
+  Models 前）、renderCatalog/loadCatalog（KPI 头部 + mcard 卡片网格：
+  publisher chip + prettyName + 完整原始 id + owned_by + created 本地时间）、
+  刷新按钮 + "Cached <时间>"文案；动态值全部 `esc()`。
+- e2e 新测试：未登录 401、登录后 200、缓存命中不打上游、`?refresh=1`
+  强制重取、客户端 `/v1/models` 与 dashboard 共享缓存（上游切换后双方
+  同步刷新）。
+- 文档：`knowledge/decisions/dashboard-model-catalog.md`、`index.md` 行、
+  `log.md` 条目、CHANGELOG Unreleased。
+- 验证门：本机无 rustfmt/clippy（WSL 源码 tarball 工具链），以
+  `cargo build --all-targets` 零警告代替；`cargo test` 125 unit + 95 e2e
+  全绿。CI 将执行 fmt/clippy。

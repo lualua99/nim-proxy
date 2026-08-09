@@ -28,7 +28,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Backed by a session-gated `GET /api/models` that shares the proxy's existing
   TTL cache and rate-limited refresh path, so the dashboard never refetches
   the catalog outside the /v1/models cache policy and a forced refresh also
-  warms the harness-facing cache.
+  warms the harness-facing caches.
+- **Wait stages distinguished in the queue view**: a not-yet-sent request now
+  reports where it's parked — `waiting_permit` (blocked on the governor's
+  worker-concurrency gate) vs `waiting_slot` (waiting on the global
+  rate-limit FIFO) — instead of a single `queued` value. The Queue tab's KPI
+  strip gained a dedicated tile for each stage (rate-limit slot waiters,
+  model-capacity waiters, plus the in-flight total), and each row's phase
+  badge shows the stage, so an operator can tell a key-limits bottleneck
+  from a model-concurrency one at a glance.
+- **Self-calibrating lanes (adaptive per-key ceiling)**: each pool lane now
+  carries a `Calibration` factor on its configured rpm, learned from
+  upstream rejections. A real 429/5xx shrinks the factor (×0.9 per event;
+  the lockout signature — repeated `Retry-After >= 30s` 429s — applies an
+  extra ×0.5 and a lower floor), and `maybe_probe` heals it upward one
+  `PROBE_STEP` per silent interval (default 3600s,
+  `NIMPROXY_CALIBRATION_PROBE_SECS`). Admission and the reservation window
+  math use the effective rate everywhere, the factor carries across pool
+  rebuilds, and connect errors stay bench-only (they say nothing about a
+  lane's ceiling). The dashboard key rows and lane meters show the measured
+  budget (`in_window / effective`, with the ×factor when < 1), and the new
+  per-lane gauge `nimproxy_lane_calibration` republishes on every
+  shrink/probe. Conservative by construction: never above the configured
+  rpm (calibration only corrects over- and under-use), never zero
+  (`effective_rpm` floors at 1 so the window math can't dead-lock).
 
 ### Changed
 

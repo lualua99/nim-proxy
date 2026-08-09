@@ -456,8 +456,9 @@ body.on-settings .tright, body.on-settings #custom { display: none; }
 
   <section id="tab-queue" hidden>
     <div class="row">
-      <div class="htile" style="flex:1 1 240px" id="q-count"></div>
-      <div class="htile" style="flex:2 1 460px" id="q-queued"></div>
+      <div class="htile" style="flex:1 1 200px" id="q-count"></div>
+      <div class="htile" style="flex:1 1 240px" id="q-slot"></div>
+      <div class="htile" style="flex:1 1 240px" id="q-permit"></div>
     </div>
     <div class="card">
       <h2><svg class="hic" viewBox="0 0 16 16"><path d="M2 4.5h6.5M2 8h12M2 11.5h6.5"/><circle cx="10.5" cy="4.5" r="1"/><circle cx="10.5" cy="11.5" r="1"/></svg>In-flight requests <span class="note">across all clients right now</span><span class="hr"><button class="pbtn" id="q-refresh">Refresh</button></span></h2>
@@ -1858,11 +1859,15 @@ function renderCapacity(c) {
   const laneOther = wgroups('nimproxy_lane_benched_total', 'lane', l => l.status !== '429');
   const totalLane = [...laneWindow.values()].reduce((a, b) => a + b, 0) || 1;
   const laneColor = i => LANE_COLORS[i % LANE_COLORS.length];
+  /* per-lane calibration factor from the settings snapshot (live only while
+     the settings tab has fetched; defaults to 1 = configured budget) */
+  const laneCal = i => { const k = (SET.nim_keys || []).find(x => x.lane === i); return k && k.cal_factor != null ? +k.cal_factor : 1; };
+  const laneEff = i => Math.max(1, Math.round(laneRpm(i) * laneCal(i)));
   const lanes = Array.from({ length: cfg.lanes }, (_, i) => {
     const k = String(i);
     const currentRpm = nowLaneRates.get(k) || 0;
     return { i, name: `Lane slot ${i + 1}`, cur: laneWindow.get(k) || 0, currentRpm,
-      util: Math.min(1, currentRpm / Math.max(1, laneRpm(i))),
+      util: Math.min(1, currentRpm / Math.max(1, laneEff(i))),
       b429: lane429.get(k) || 0, bOther: laneOther.get(k) || 0 };
   });
   if (!lanes.length) $('meters').innerHTML = '<div class="empty">No lanes configured</div>';
@@ -1883,7 +1888,8 @@ function renderCapacity(c) {
   ], lanes.map(l => ({
     vals: [l.name, l.cur, l.cur / totalLane * 100, l.currentRpm, l.b429, l.bOther],
     cells: [`<i class="sw" style="background:${laneColor(l.i)}"></i>${esc(l.name)}`,
-      fmt(l.cur), (l.cur / totalLane * 100).toFixed(0) + '%', `${fmt(l.currentRpm)} / ${laneRpm(l.i)}`,
+      fmt(l.cur), (l.cur / totalLane * 100).toFixed(0) + '%',
+      `${fmt(l.currentRpm)} / ${laneEff(l.i)}${laneCal(l.i) < 1 ? ` ×${laneCal(l.i).toFixed(2)}` : ''}`,
       `<span class="${l.b429 ? 'warnc' : 'dim'}">${fmt(l.b429)}</span>`,
       `<span class="${l.bOther ? 'critc' : 'dim'}">${fmt(l.bOther)}</span>`],
   })), { defaultIdx: 1, maxH: 360, minW: 560, empty: 'No lanes configured' });
@@ -1937,7 +1943,11 @@ function renderSettings() {
 function keyState(k) {
   if (!k.enabled) return { text: 'disabled', cls: 'kstate dim' };
   if (k.cooldown_ms > 0) return { text: `cooldown ${Math.ceil(k.cooldown_ms / 1000)}s`, cls: 'kstate warnc' };
-  if (k.in_window != null) return { text: `${+k.in_window} / ${+k.rpm} in window`, cls: 'kstate' };
+  if (k.in_window != null) {
+    const eff = Math.max(1, Math.round(+k.rpm * (+k.cal_factor || 1)));
+    const cal = +k.cal_factor < 1 ? ` ×${(+k.cal_factor).toFixed(2)}` : '';
+    return { text: `${+k.in_window} / ${eff} in window${cal}`, cls: 'kstate' };
+  }
   return { text: 'unassigned', cls: 'kstate dim' };
 }
 const poolNote = () => `${+SET.pool.enabled} enabled in pool · ${+SET.pool.capacity_rpm} rpm total`;
@@ -2444,22 +2454,27 @@ let QUEUE = null, QUEUEERR = null, queueBusy = false, queueStamp = 0;
 function renderQueueTab() {
   if (QUEUEERR) {
     $('q-count').innerHTML = `<div class="hlabel">In-flight requests</div><div class="hlabel note">unavailable</div>`;
-    $('q-queued').innerHTML = '';
+    $('q-slot').innerHTML = '';
+    $('q-permit').innerHTML = '';
     $('q-list').innerHTML = `<div class="empty">${esc(QUEUEERR)}</div>`;
     return;
   }
   if (!QUEUE) {
     $('q-count').innerHTML = `<div class="hlabel">In-flight requests</div><div class="hlabel note">loading…</div>`;
-    $('q-queued').innerHTML = '';
+    $('q-slot').innerHTML = '';
+    $('q-permit').innerHTML = '';
     $('q-list').innerHTML = '<div class="empty">Loading…</div>';
     return;
   }
   const list = (QUEUE.requests || []).filter(Boolean);
-  const waiting = list.filter(r => r.phase === 'queued').length;
+  const waitingSlot = list.filter(r => r.phase === 'waiting_slot').length;
+  const waitingPermit = list.filter(r => r.phase === 'waiting_permit').length;
   $('q-count').innerHTML = `<div class="hlabel">In-flight requests</div>
     <div style="font-size:30px;font-weight:600;letter-spacing:-1px;color:var(--ink-1)">${list.length}</div>`;
-  $('q-queued').innerHTML = `<div class="hlabel">Waiting for an upstream slot</div>
-    <div style="font-size:30px;font-weight:600;letter-spacing:-1px;color:${waiting ? 'var(--amber)' : 'var(--ink-1)'}">${waiting}</div>`;
+  $('q-slot').innerHTML = `<div class="hlabel">Waiting for a rate-limit slot</div>
+    <div style="font-size:30px;font-weight:600;letter-spacing:-1px;color:${waitingSlot ? 'var(--amber)' : 'var(--ink-1)'}">${waitingSlot}</div>`;
+  $('q-permit').innerHTML = `<div class="hlabel">Waiting for model capacity</div>
+    <div style="font-size:30px;font-weight:600;letter-spacing:-1px;color:${waitingPermit ? 'var(--amber)' : 'var(--ink-1)'}">${waitingPermit}</div>`;
   const body = $('q-list');
   body.innerHTML = list.length
     ? list.map(queueRow).join('')
@@ -2471,9 +2486,11 @@ function renderQueueTab() {
 function queueRow(r) {
   const id = String(r.id || '');
   const age = Math.max(0, Date.now() / 1000 - (+r.started_at || 0));
-  const phase = r.phase === 'queued'
-    ? '<span class="rbadge user">queued</span>'
-    : '<span class="rbadge">upstream</span>';
+  const phase = r.phase === 'waiting_permit'
+    ? '<span class="rbadge admin">waiting · permit</span>'
+    : r.phase === 'waiting_slot'
+      ? '<span class="rbadge user">waiting · slot</span>'
+      : '<span class="rbadge">upstream</span>';
   return `<div class="krow">
     ${clientChip(r.client)}
     <div style="min-width:0;flex:1">

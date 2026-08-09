@@ -22,8 +22,41 @@ Each API key is a **lane** holding a `VecDeque<Instant>` of send timestamps
 - **Penalize**: an upstream 429/5xx benches the lane (`Retry-After` honored,
   defaults 10s for 429, 5s for connect errors). Benched lanes are skipped;
   other lanes absorb traffic.
+- **Observe** (calibration): the same rejections feed a per-lane
+  `Calibration` factor — short-term *cooldown* (benching) and long-term
+  *memory* are separate mechanisms. Connect errors are bench-only: they say
+  nothing about the lane's own ceiling.
 - **Release**: a reservation granted to a client that vanished while queued
   is removed from the window by its stamp, returning the slot.
+
+## Calibration (measured ceiling)
+
+NIM's ~40 RPM is a soft, account/load-dependent ceiling, so the
+configured `rpm` is only a starting guess. Each lane holds a
+`Calibration` (a factor on the configured budget) learned from upstream
+rejections:
+
+- **Shrink**: each observed 429/5xx multiplies the factor by 0.9.
+  429s with `Retry-After >= 30s` show NIM's exponential-lockout shape:
+  every second such event applies an extra ×0.5 and flags the lane as
+  *locked*, whose floor is 0.1 instead of the ordinary 0.2. `effective_rpm`
+  is `floor(rpm × factor)`, never 0 (would dead-lock the window math).
+- **Heal**: `maybe_probe` runs on every `reserve` visit — after a full
+  probe interval of silence (default 3600s, `NIMPROXY_CALIBRATION_PROBE_SECS`)
+  the factor steps up by `PROBE_STEP` (0.01). Deliberately slow: the
+  upstream's account-level throttle can outlast tens of minutes of quiet.
+- **Carry-over**: the factor travels with the lane across
+  `Pool::rebuild` (same key-string match as the window/cooldown), so a
+  re-configured key doesn't forget what the upstream taught it.
+- **Signals**: `Signal::RateLimited { retry_after }` vs `Signal::ServerError`
+  — a 429 and a 503 are different reasons to shrink. The proxy feeds
+  `Pool::observe` from `upstream_signal()` only for retryable upstream
+  responses, never connect errors.
+
+Admission (`try_take`, `reserve`'s window math) uses the effective rate
+everywhere, including the dashboard's per-lane meters (key row shows
+`in_window / effective` and the × factor when < 1). Gauge
+`nimproxy_lane_calibration` per lane is republished on every shrink/probe.
 
 ## Per-key rpm and live rebuild (v0.6.0)
 

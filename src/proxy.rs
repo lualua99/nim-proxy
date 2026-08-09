@@ -20,6 +20,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::dispatch::Slot;
 use crate::governor::{self, ModelPermit};
+use crate::pool::Signal;
 use crate::registry::Registered;
 use crate::{AppState, Config};
 
@@ -126,12 +127,30 @@ fn retryable(status: reqwest::StatusCode) -> bool {
 
 /// Backoff for a benched lane: honor Retry-After when present.
 fn backoff_for(resp: &reqwest::Response) -> Duration {
+    retry_after_secs(resp)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(10))
+}
+
+/// The response's Retry-After, as seconds, when present and parseable.
+fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
     resp.headers()
         .get(header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(10))
+}
+
+/// What a retryable upstream status means for the lane's calibration:
+/// 429s carry the lockout runway (`Retry-After`), other retryables are
+/// plain server-side strain.
+fn upstream_signal(resp: &reqwest::Response) -> Option<Signal> {
+    match resp.status().as_u16() {
+        429 => Some(Signal::RateLimited {
+            retry_after: retry_after_secs(resp),
+        }),
+        500 | 502 | 503 | 504 => Some(Signal::ServerError),
+        _ => None,
+    }
 }
 
 /// Join the global FIFO queue for a rate-limit slot, invoking `on_wait` every
@@ -208,10 +227,16 @@ async fn acquire_model_permit(
 /// Bench the granting lane after the upstream told us to back off. Routes
 /// through the slot's own pool, so a bench that races a settings-driven pool
 /// swap lands on the (possibly retired) generation that made the grant.
-fn bench(slot: &Slot, status: &str, backoff: Duration) {
+/// `signal` distinguishes real upstream rate-limits/errors (which shrink the
+/// lane's long-term calibration) from connect failures (which say nothing
+/// about the lane's own ceiling and are bench-only).
+fn bench(slot: &Slot, status: &str, backoff: Duration, signal: Option<Signal>) {
     counter!("nimproxy_lane_benched_total", "lane" => slot.lane.to_string(), "status" => status.to_owned())
         .increment(1);
     slot.pool.penalize(slot.lane, backoff);
+    if let Some(sig) = signal {
+        slot.pool.observe(slot.lane, sig);
+    }
 }
 
 fn record_request(ctx: &Ctx, status: &str) {
@@ -605,7 +630,7 @@ pub async fn handle(
         ctx.client.clone(),
         ctx.model.clone(),
         ctx.path.clone(),
-        "queued",
+        "waiting_permit",
     );
 
     // Fingerprint what the harness asked for (generation endpoints only).
@@ -727,11 +752,13 @@ async fn buffered(
             // Two admission gates: a model-pressure permit (worker concurrency,
             // held through the whole upstream exchange — dropped on every exit
             // from this iteration), then an RPM slot.
+            state.registry.set_phase(id, "waiting_permit");
             let Ok(_permit) = acquire_model_permit(&state, &cfg, &ctx, deadline, || true).await
             else {
                 record_request(&ctx, "504");
                 return gateway_timeout(&cfg, state.pool().len());
             };
+            state.registry.set_phase(id, "waiting_slot");
             let Some(slot) = reserve_slot(&state, cfg.heartbeat, deadline, prefer, || true).await
             else {
                 record_request(&ctx, "504");
@@ -757,13 +784,14 @@ async fn buffered(
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!(lane = slot.lane, error = %e, "upstream connection error, retrying");
-                    bench(&slot, "connect", Duration::from_secs(5));
+                    bench(&slot, "connect", Duration::from_secs(5), None);
                     continue;
                 }
             };
             if retryable(resp.status()) && Instant::now() < deadline {
                 let status = resp.status();
                 let backoff = backoff_for(&resp);
+                let signal = upstream_signal(&resp);
                 // Sniff the error body: worker exhaustion is model-scoped (shared
                 // across every key), so benching the lane would just burn healthy
                 // key capacity on a failover that cannot help.
@@ -775,7 +803,7 @@ async fn buffered(
                     continue; // permit drops here; re-admission waits out the drain
                 }
                 tracing::info!(lane = slot.lane, %status, ?backoff, "lane benched, retrying");
-                bench(&slot, status.as_str(), backoff);
+                bench(&slot, status.as_str(), backoff, signal);
                 continue;
             }
             histogram!("nimproxy_upstream_seconds", "model" => ctx.model.clone())
@@ -843,6 +871,7 @@ fn streaming(
                 // slot — both heartbeating so the harness doesn't hang up. The
                 // permit spans the whole upstream exchange and drops on every
                 // exit from this iteration.
+                state.registry.set_phase(id, "waiting_permit");
                 let Ok(_permit) = acquire_model_permit(&state, &cfg, &ctx, deadline, || {
                     tx.try_send(Ok(Bytes::from_static(b": heartbeat\n\n")))
                         .is_ok()
@@ -857,6 +886,7 @@ fn streaming(
                         .await;
                     return;
                 };
+                state.registry.set_phase(id, "waiting_slot");
                 let slot = reserve_slot(&state, cfg.heartbeat, deadline, prefer, || {
                     tx.try_send(Ok(Bytes::from_static(b": heartbeat\n\n")))
                         .is_ok()
@@ -889,7 +919,7 @@ fn streaming(
                     Ok(r) => r,
                     Err(e) => {
                         tracing::warn!(lane = slot.lane, error = %e, "upstream connection error, retrying");
-                        bench(&slot, "connect", Duration::from_secs(5));
+                        bench(&slot, "connect", Duration::from_secs(5), None);
                         continue;
                     }
                 };
@@ -913,6 +943,7 @@ fn streaming(
                     }
                     let status = resp.status();
                     let backoff = backoff_for(&resp);
+                    let signal = upstream_signal(&resp);
                     // Worker exhaustion is model-scoped: back off the model via
                     // the governor, never the lane (see `buffered`).
                     let detail = resp.text().await.unwrap_or_default();
@@ -923,7 +954,7 @@ fn streaming(
                         );
                     } else {
                         tracing::info!(lane = slot.lane, %status, ?backoff, "lane benched, retrying");
-                        bench(&slot, status.as_str(), backoff);
+                        bench(&slot, status.as_str(), backoff, signal);
                     }
                     if !send(": retrying\n\n").await {
                         record_request(&ctx, "disconnect");
@@ -1149,7 +1180,10 @@ async fn catalog(
         }
         Ok(resp) => {
             if retryable(resp.status()) {
-                bench(&slot, resp.status().as_str(), backoff_for(&resp));
+                let status = resp.status();
+                let backoff = backoff_for(&resp);
+                let signal = upstream_signal(&resp);
+                bench(&slot, status.as_str(), backoff, signal);
             }
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);

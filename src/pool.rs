@@ -11,14 +11,27 @@
 //!
 //! Disabled keys stay in the pool as inactive *state carriers* (never
 //! granted, invisible to `len`/capacity/stats — they sit past the `active`
-//! boundary). Without them, a disable→enable cycle spans two rebuilds and
-//! the second would resurrect the key with a fresh window while the
-//! upstream's window still remembers it — load-tested to cause real
-//! upstream 429s before this existed.
+//! boundary). They exist so a disable→enable cycle can't reset the window;
+//! a re-enabled key comes back warm instead of double-spending the
+//! upstream's window. The same carry-over keeps a rebuilt pool's
+//! calibration memory for a key that was only re-configured.
+//!
+//! ## Calibration
+//!
+//! NIM's ~40 RPM is a soft, account/load-dependent ceiling, so the
+//! configured `rpm` is only a starting guess. Each lane carries a
+//! [`Calibration`] that learns the *measured* ceiling from upstream
+//! rejections ([`Pool::observe`]) and shrinks admission ahead of the next
+//! 429. The factor only ever shrinks quickly and heals slowly (see
+//! [`Calibration::maybe_probe`]), so the zero-violation posture — never
+//! exceed the window the upstream actually grants — is preserved by
+//! construction.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
+
+use metrics::gauge;
 
 /// Shared, swappable pool: readers snapshot an `Arc<Pool>`; the settings
 /// layer swaps in a rebuilt pool under the write lock.
@@ -32,6 +45,135 @@ pub type PoolHandle = Arc<RwLock<Arc<Pool>>>;
 /// upstream window; with the pad, zero. Costs ~1.6% peak throughput.
 const WINDOW: Duration = Duration::from_secs(61);
 
+/// How much of the configured `rpm` a lane may use after upstream
+/// rejections. Starts at 1.0 (trust the config) and decays on observed
+/// 429s/5xxs; `maybe_probe` heals it upward slowly.
+const CAL_INITIAL: f64 = 1.0;
+/// Floor for the calibration factor: even a badly-locked lane keeps this
+/// share of its configured budget, so a key that briefly misbehaves isn't
+/// quashed to 0 forever.
+const CAL_FLOOR: f64 = 0.2;
+/// Multiplicative decay applied per rejection event (hang/short backoff).
+const CAL_DECAY: f64 = 0.9;
+/// Extra penalty applied after the lockout signature: 2+ rejections with
+/// `Retry-After >= 30s` (NIM's exponential-lockout shape). Abrupt and
+/// severe, because such lanes are in cooldown anyway.
+const CAL_LOCKOUT_FACTOR: f64 = 0.5;
+/// Floor for a lockout-flagged lane (severe decay on top of the ordinary one).
+const CAL_LOCKOUT_FLOOR: f64 = 0.1;
+/// `Retry-After` (s) that counts as "locked out" when seen repeatedly.
+const LOCKOUT_RETRY_AFTER: u64 = 30;
+
+/// How long a lane must stay quiet before the calibration factor climbs a
+/// step. Deliberately long: recovery must not race the upstream's own
+/// account-level view, which can stay throttled for tens of minutes.
+static PROBE_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_secs(
+        std::env::var("NIMPROXY_CALIBRATION_PROBE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3600),
+    )
+});
+/// The step size for [`Calibration::maybe_probe`].
+const PROBE_STEP: f64 = 0.01;
+
+/// What the lane observed upstream, for calibration. Deliberately typed:
+/// a 429 and a 503 are different *reasons* to shrink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Signal {
+    /// Upstream rate-limit: `Retry-After` seconds when the response carried
+    /// it (NIM's lockout runway). 5xx and connect errors also carry a
+    /// Either value as a conservative miss.
+    RateLimited { retry_after: Option<u64> },
+    /// A 5xx that was retried. Same shrink, no lockout escalation.
+    ServerError,
+}
+
+/// Per-lane long-term capacity memory: a factor on the configured `rpm`
+/// learned from upstream rejections. Not synchronized internally — the
+/// caller holds the lane's calibration lock.
+#[derive(Clone, Debug)]
+pub struct Calibration {
+    factor: f64,
+    /// Protocol-level lockout seen at least once recently.
+    locked: bool,
+    /// Wall-clock of the most recent observation (for probe gating).
+    last_event: Option<Instant>,
+    /// Consecutive `Retry-After`-carrying rate-limit events.
+    consecutive_locks: u32,
+}
+
+impl Calibration {
+    fn new() -> Self {
+        Self {
+            factor: CAL_INITIAL,
+            locked: false,
+            last_event: None,
+            consecutive_locks: 0,
+        }
+    }
+
+    /// Apply an observed upstream rejection to the calibration S-shaped.
+    /// `locked` escalates after the lockout signature (2+ rate-limits with
+    /// Retry-After >= 30s): such lanes are in exponential backoff upstream,
+    /// so admission is cut far below the floor until clean probes restore.
+    fn observe(&mut self, signal: Signal, now: Instant) {
+        self.last_event = Some(now);
+        match signal {
+            Signal::RateLimited { retry_after } => {
+                let lockout = retry_after.map(|s| s >= LOCKOUT_RETRY_AFTER).unwrap_or(false);
+                self.consecutive_locks = if lockout {
+                    self.consecutive_locks + 1
+                } else {
+                    0
+                };
+                if self.consecutive_locks >= 2 {
+                    self.locked = true;
+                    self.consecutive_locks = 0;
+                    // Severe: the upstream is in its exponential-lockout
+                    // runway, so cut far below the ordinary floor.
+                    self.factor *= CAL_LOCKOUT_FACTOR;
+                }
+                self.factor *= CAL_DECAY;
+            }
+            Signal::ServerError => {
+                self.consecutive_locks = 0;
+                self.factor *= CAL_DECAY;
+            }
+        }
+        self.factor = self.factor.max(if self.locked { CAL_LOCKOUT_FLOOR } else { CAL_FLOOR });
+    }
+
+    /// Heal toward 1.0, at most one `PROBE_STEP` per PROBE_INTERVAL of
+    /// silence. Called on every reserve while the lane has capacity, so an
+    /// idle lane simply re-learns its true ceiling after the upstream has
+    /// relaxed. Returns true when the factor actually changed (so the gauge
+    /// can be republished).
+    fn maybe_probe(&mut self, now: Instant) -> bool {
+        if self.factor >= 1.0 {
+            return false;
+        }
+        if let Some(last) = self.last_event {
+            if now.duration_since(last) >= *PROBE_INTERVAL {
+                self.factor = (self.factor + PROBE_STEP).min(1.0);
+                // A probe is an "event" too — the next step needs another
+                // full interval of quiet, not a fast re-probe.
+                self.last_event = Some(now);
+                self.locked = false;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Configured `rpm` scaled by the factor, never 0 for an enabled lane
+    /// (0 would deadlock `reserve`'s window math).
+    fn effective_rpm(&self, rpm: usize) -> usize {
+        (rpm as f64 * self.factor).floor().max(1.0) as usize
+    }
+}
+
 /// A lane blueprint. Disabled specs become state carriers: held for their
 /// rate state, never granted.
 pub struct LaneSpec {
@@ -43,12 +185,16 @@ pub struct LaneSpec {
 struct Lane {
     key: String,
     /// This key's requests-per-minute budget (keys can differ: paid tiers,
-    /// self-hosted NIM).
+    /// self-hosted NIM). Configured value — the *effective* budget for
+    /// admission is `cal.effective_rpm(rpm)`.
     rpm: usize,
     /// Timestamps of requests sent within the last WINDOW.
     sent: Mutex<VecDeque<Instant>>,
     /// Lane is benched until this instant (set after an upstream 429/5xx).
     cooldown_until: Mutex<Instant>,
+    /// Long-term capacity memory (calibration factor). Locked together
+    /// with nothing else; `observe`/`maybe_probe` touch only this.
+    calibration: Mutex<Calibration>,
 }
 
 pub struct Pool {
@@ -64,6 +210,9 @@ pub struct LaneStat {
     pub rpm: usize,
     pub in_window: usize,
     pub cooldown_ms: u64,
+    /// The lane's current calibration factor (0.0..=1.0): the share of
+    /// `rpm` it actually admits per minute.
+    pub cal_factor: f64,
 }
 
 pub enum Reservation {
@@ -108,6 +257,7 @@ impl Pool {
                     Some(prev) => Lane {
                         sent: Mutex::new(prev.sent.lock().unwrap().clone()),
                         cooldown_until: Mutex::new(*prev.cooldown_until.lock().unwrap()),
+                        calibration: Mutex::new(prev.calibration.lock().unwrap().clone()),
                         key: s.key,
                         rpm: s.rpm,
                     },
@@ -116,6 +266,7 @@ impl Pool {
                         rpm: s.rpm,
                         sent: Mutex::new(VecDeque::new()),
                         cooldown_until: Mutex::new(now),
+                        calibration: Mutex::new(Calibration::new()),
                     },
                 },
             )
@@ -159,6 +310,7 @@ impl Pool {
                     rpm: l.rpm,
                     in_window,
                     cooldown_ms,
+                    cal_factor: l.calibration.lock().unwrap().factor,
                 }
             })
             .collect()
@@ -172,11 +324,14 @@ impl Pool {
         if *lane.cooldown_until.lock().unwrap() > now {
             return None;
         }
+        let cal = lane.calibration.lock().unwrap();
+        let effective = cal.effective_rpm(lane.rpm);
+        drop(cal);
         let mut sent = lane.sent.lock().unwrap();
         while sent.front().is_some_and(|t| now - *t >= WINDOW) {
             sent.pop_front();
         }
-        if sent.len() < lane.rpm {
+        if sent.len() < effective {
             sent.push_back(now);
             Some(Reservation::Ready {
                 lane: i,
@@ -194,9 +349,18 @@ impl Pool {
     /// a single key); otherwise the least-loaded ready lane wins, spreading
     /// concurrent in-flight requests evenly across keys. An out-of-range
     /// `prefer` (computed against a pool that has since shrunk) is ignored.
+    ///
+    /// Each visit is also a chance to heal the lane's calibration factor
+    /// ([`Calibration::maybe_probe`]): a lane that has been quiet for a full
+    /// probe interval and has capacity climbs toward its configured ceiling.
     pub fn reserve(&self, prefer: Option<usize>) -> Reservation {
         let now = Instant::now();
         if let Some(p) = prefer.filter(|&p| p < self.active) {
+            if self.lanes[p].calibration.lock().unwrap().maybe_probe(now) {
+                gauge!("nimproxy_lane_calibration", "lane" => p.to_string()).set(
+                    self.lanes[p].calibration.lock().unwrap().factor,
+                );
+            }
             if let Some(r) = self.try_take(p, now, true) {
                 return r;
             }
@@ -206,18 +370,28 @@ impl Pool {
         let mut best_wait = WINDOW;
         for (i, lane) in self.lanes[..self.active].iter().enumerate() {
             let cooldown = *lane.cooldown_until.lock().unwrap();
+            let effective = {
+                let mut cal = lane.calibration.lock().unwrap();
+                let probed = cal.maybe_probe(now);
+                if probed {
+                    gauge!("nimproxy_lane_calibration", "lane" => i.to_string())
+                        .set(cal.factor);
+                }
+                cal.effective_rpm(lane.rpm)
+            };
             let mut sent = lane.sent.lock().unwrap();
             while sent.front().is_some_and(|t| now - *t >= WINDOW) {
                 sent.pop_front();
             }
-            let window_ready = if sent.len() < lane.rpm {
+            let window_ready = if sent.len() < effective {
                 now
-            } else if lane.rpm == 0 {
-                // validate() forbids rpm 0, but a panic here would kill the
-                // dispatcher task and hang every request — never index in.
+            } else if effective == 0 {
+                // never happens (effective_rpm floors at 1), but a
+                // panic here would kill the dispatcher task and hang
+                // every request — never index in.
                 now + WINDOW
             } else {
-                sent[sent.len() - lane.rpm] + WINDOW
+                sent[sent.len() - effective] + WINDOW
             };
             let ready_at = window_ready.max(cooldown);
             if ready_at <= now {
@@ -251,6 +425,28 @@ impl Pool {
         if *cd < until {
             *cd = until;
         }
+    }
+
+    /// Feed an upstream rejection into the lane's long-term calibration.
+    /// Short-term backoff (cooldown) is `penalize`'s job; this is the
+    /// long-term memory that reshapes admission ahead of the next 429.
+    pub fn observe(&self, lane: usize, signal: Signal) {
+        let now = Instant::now();
+        let factor = {
+            let mut cal = self.lanes[lane].calibration.lock().unwrap();
+            cal.observe(signal, now);
+            cal.factor
+        };
+        gauge!("nimproxy_lane_calibration", "lane" => lane.to_string()).set(factor);
+    }
+
+    /// The per-lane calibration factors (enabled lanes, in lane order) —
+    /// feeds the dashboard's measured-capacity meter.
+    pub fn calibration_factors(&self) -> Vec<f64> {
+        self.lanes[..self.active]
+            .iter()
+            .map(|l| l.calibration.lock().unwrap().factor)
+            .collect()
     }
 }
 
@@ -463,5 +659,57 @@ mod tests {
         // Raising grants the extra headroom immediately.
         let raised = pool.rebuild(keys(1, 3));
         assert!(matches!(raised.reserve(None), Reservation::Ready { .. }));
+    }
+
+    #[test]
+    fn observe_rate_limit_shrinks_admission() {
+        // rpm=10, one 429 with Retry-After=5: the lane admits ~9/min now.
+        let pool = Pool::new(keys(1, 10));
+        pool.observe(0, Signal::RateLimited { retry_after: Some(5) });
+        let mut granted = 0;
+        while let Reservation::Ready { .. } = pool.reserve(None) {
+            granted += 1;
+        }
+        assert_eq!(granted, 9);
+    }
+
+    #[test]
+    fn lockout_signature_cuts_far_below_floor() {
+        // Repeated 429s with Retry-After >= 30s = exponential-lockout
+        // shape: each pair triggers the severe factor, so after a few
+        // lockouts the lane lands below the ordinary floor — but keeps a
+        // minimal budget (never dead-locked).
+        let pool = Pool::new(keys(1, 10));
+        for _ in 0..4 {
+            pool.observe(0, Signal::RateLimited { retry_after: Some(30) });
+        }
+        let eff = pool.lane_stats()[0].cal_factor;
+        assert!(eff < CAL_FLOOR, "locked lane should sit under the floor: {eff}");
+        assert!(eff >= CAL_LOCKOUT_FLOOR);
+        // Effective must keep a minimal budget, not zero: one grant stays.
+        assert!(matches!(pool.reserve(None), Reservation::Ready { .. }));
+        assert!(matches!(pool.reserve(None), Reservation::Wait(_)));
+    }
+
+    #[test]
+    fn server_error_shrinks_without_lockout() {
+        let pool = Pool::new(keys(1, 10));
+        pool.observe(0, Signal::ServerError);
+        let eff = pool.lane_stats()[0].cal_factor;
+        assert!(eff < 1.0 && eff >= 0.2);
+        assert_eq!((10.0 * eff).floor().max(1.0) as usize, 9);
+        // No lockout flag, so on the 1-min scale a single 503 costs ~10%.
+        assert_eq!((10.0 * eff).floor() as usize, 9);
+    }
+
+    #[test]
+    fn rebuild_carries_calibration_for_kept_keys() {
+        // A key that misbehaved keeps its shrunken factor across a rebuild
+        // (yes — the same one that carries the window and cooldown).
+        let pool = Pool::new(keys(1, 10));
+        pool.observe(0, Signal::RateLimited { retry_after: Some(5) });
+        let before = pool.lane_stats()[0].cal_factor;
+        let rebuilt = pool.rebuild(keys(1, 10));
+        assert!((rebuilt.lane_stats()[0].cal_factor - before).abs() < 1e-9);
     }
 }

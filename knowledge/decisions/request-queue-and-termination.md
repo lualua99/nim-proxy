@@ -54,11 +54,15 @@ The proxy already had everything but the entity:
 Option 3, wired as:
 
 - **Entry**: `{ id, client, model, path, started, phase, kill }` where
-  `phase` is one of `queued` (waiting for a slot or model permit) /
-  `upstream` (request sent) / `retry` (riding out a wait). No content —
+  `phase` is one of `waiting_permit` (blocked on the governor's
+  worker-concurrency gate) / `waiting_slot` (waiting on the global FIFO
+  rate-limit queue) / `upstream` (request sent). No content —
   prompts, tools, usage are never recorded (privacy posture of
   [request-shape-metrics](request-shape-metrics.md) holds: counts and
-  metadata only).
+  metadata only). The two wait stages are distinct on purpose: an operator
+  staring at the Queue tab must be able to tell a key-limits bottleneck
+  (`waiting_slot`) from a model-concurrency one (`waiting_permit`) without
+  probing metrics.
 - **Kill switch**: terminate = `kill.send(true)`. The watch's
   `changed()`-then-`borrow()` pattern is edge-triggered but self-correcting
   (a pre-check covers kills that landed before a checkpoint; any later kill
@@ -84,7 +88,8 @@ Option 3, wired as:
 - **Dashboard**: a **Queue** sidebar tab (`data-tab="queue"`) visible only
   to admins — `/api/dashboard/now` now reports `role` so the button is
   hidden for plain users (server still enforces 403; no privilege widening).
-  KPI strip (in-flight total, queued count), a table of age · client
+  KPI strip (in-flight total, rate-limit-slot waiters, model-capacity
+  waiters), a table of age · client
   (monogram chip) · model (pretty name + publisher chip) · path · phase ·
   terminate button, plus empty/error states. Polls `/api/queue` at 2s only
   while the tab is visible.
@@ -105,6 +110,10 @@ Option 3, wired as:
 - `nimproxy_terminated_total{by}` records admin actions (labels bounded by
   user count, safe cardinality); request logging marks the record
   "terminated" for audit.
+- With the wait phases split, the queue view shows which gate a request is
+  parked at; the `waiting_permit` phase is expected to flash by for
+  ungoverned models (no gate = no wait), which is honest reporting rather
+  than a gap.
 - Fresh instances start with an empty registry (no persistence); after a
   restart the queue view simply shows live activity only.
 

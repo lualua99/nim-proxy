@@ -128,7 +128,8 @@ impl RequestRegistry {
         }
     }
 
-    /// Track a request's progress through the pipeline (`queued` → `upstream`).
+    /// Track a request's progress through the pipeline (`waiting_permit` →
+    /// `waiting_slot` → `upstream`).
     pub fn set_phase(&self, id: u64, phase: &'static str) {
         if let Some(entry) = self.inner.write().unwrap().get_mut(&id) {
             entry.phase = phase;
