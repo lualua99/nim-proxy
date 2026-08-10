@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::http::header;
+use futures_util::StreamExt;
 use support::{
     chat_body, complete_setup, expect_refuses_to_start, login, login_as, metrics, read_sse,
     restart, scratch_data_dir, start_mock, start_proxy, start_proxy_fresh, start_proxy_in,
@@ -1624,6 +1625,126 @@ async fn dashboard_capacity_model_contract_requires_auth_and_returns_aggregates(
     // Default pool: 3 lanes × 40 rpm = 120 capacity.
     assert_eq!(pk["capacity_rpm"], 120);
     assert_eq!(pk["rpm"], serde_json::json!([40, 40, 40]));
+}
+
+#[tokio::test]
+async fn dashboard_sse_stream_requires_auth() {
+    let mock = start_mock().await;
+    let proxy = start_proxy(&mock.url, &[]).await;
+
+    let response = client()
+        .get(proxy.url("/api/dashboard/stream"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+}
+
+#[tokio::test]
+async fn dashboard_sse_stream_returns_event_stream() {
+    let mock = start_mock().await;
+    let proxy = start_proxy(&mock.url, &[]).await;
+    let cookie = login(&proxy).await;
+
+    let response = client()
+        .get(proxy.url("/api/dashboard/stream"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/event-stream"
+    );
+}
+
+/// Read the SSE stream only until the first `data: {` JSON payload arrives
+/// (the dashboard stream never terminates, so `read_sse`'s EOF wait won't do).
+async fn read_first_sse_json(resp: reqwest::Response) -> String {
+    let mut out = String::new();
+    let mut stream = resp.bytes_stream();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while let Ok(Some(chunk)) = tokio::time::timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        stream.next(),
+    )
+    .await
+    {
+        let chunk: bytes::Bytes = chunk.expect("stream chunk");
+        out.push_str(&String::from_utf8_lossy(&chunk));
+        if out.contains("data: {") {
+            break;
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn dashboard_sse_stream_receives_data_within_timeout() {
+    let mock = start_mock().await;
+    let proxy = start_proxy(&mock.url, &[]).await;
+    let cookie = login(&proxy).await;
+
+    let response = client()
+        .get(proxy.url("/api/dashboard/stream"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let body = read_first_sse_json(response).await;
+    // The first data event should arrive within 3 seconds (the push interval).
+    assert!(
+        body.contains("data: {"),
+        "SSE body should contain a data: line:\n{body}"
+    );
+    assert!(
+        body.contains("sampled_at"),
+        "data payload should contain sampled_at:\n{body}"
+    );
+    assert!(
+        body.contains("lanes"),
+        "data payload should contain lanes:\n{body}"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_sse_stream_connection_limit_returns_503() {
+    let mock = start_mock().await;
+    let proxy = start_proxy(&mock.url, &[]).await;
+    let cookie = login(&proxy).await;
+
+    // Open enough concurrent SSE connections to exhaust the limit (100) and
+    // verify the next one is rejected with 503. Each response body is held
+    // open so the server-side tasks stay alive.
+    let mut streams = Vec::new();
+    let mut saw_503 = false;
+    for _ in 0..120 {
+        let resp = client()
+            .get(proxy.url("/api/dashboard/stream"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        if resp.status() == 503 {
+            saw_503 = true;
+            let err: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(err["error"]["code"], "too_many_streams");
+            break;
+        }
+        streams.push(resp);
+    }
+    assert!(
+        saw_503,
+        "expected a 503 once the SSE connection limit is hit"
+    );
 }
 
 #[tokio::test]

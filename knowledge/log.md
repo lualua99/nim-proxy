@@ -6,6 +6,28 @@ description: Append-only record of ingests, decisions, and maintenance passes.
 
 # Log
 
+## [2026-08-10] decision — realtime dashboard push over SSE
+
+- `knowledge/decisions/realtime-dashboard-sse.md` (new): decision page; `index.md`
+  row added. SSE over WebSocket, full snapshots over incremental delta (v1).
+- `src/lib.rs`: `dashboard_now_payload(state, username)` extracted from
+  `api_dashboard_now` (both now share it). New `GET /api/dashboard/stream`
+  endpoint on the protected router (under `require_session`): a per-connection
+  `mpsc` channel fed by a 3s interval ticker, surfaced as
+  `axum::response::sse::Sse` with a 15s text keepalive. `AppState` gains
+  `sse_connections: AtomicUsize`; exceeding `MAX_SSE_CONNECTIONS` (100) returns
+  503 `too_many_streams`. Counter released when the client disconnects
+  (`tx.send` errors).
+- `src/dashboard.html`: `pollNow()` processing extracted into
+  `handleNowPayload()`; `startSSE()` opens an `EventSource` on
+  `/api/dashboard/stream` and degrades to the existing poll interval on error;
+  `visibilitychange` closes/reopens the stream on tab hide/show. Boot still
+  does one `pollNow()` for an immediate first paint.
+- `tests/e2e.rs`: 4 new tests — stream requires auth (401), returns
+  `text/event-stream`, delivers a `data:` JSON payload within the push interval,
+  and returns 503 once the connection limit is reached.
+- Verification: fmt + clippy clean; unit + e2e green.
+
 ## [2026-08-10] ingest — login page beautify (dashboard-aligned theme)
 
 - `src/auth.rs`: `login_html()` rewritten with dashboard-aligned CSS variables

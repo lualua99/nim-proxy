@@ -2969,57 +2969,89 @@ async function refreshSelectedRange() {
 }
 
 let pollingNow = false;
+let pollingInterval = null;
+let sseSource = null;
 async function pollNow() {
   if (pollingNow) return;
   pollingNow = true;
   try {
     const response = await fetch('/api/dashboard/now');
     if (!response.ok) throw new Error(`now ${response.status}`);
-    const next = await response.json();
-    const nextRows = next.metrics.map(asRow);
-    const historyChanged = rangeData && next.history_revision !== rangeData.history_revision;
-    const configChanged = nowData && next.config_revision !== nowData.config_revision;
-
-    if (previousNow) {
-      nowRpm = rate(sum(nextRows, 'nimproxy_requests_total'),
-        sum(previousNow.rows, 'nimproxy_requests_total'),
-        next.sampled_at * 1000, previousNow.t);
-      if (configChanged) {
-        nowLaneRates = new Map();
-      } else {
-        const currentLanes = groups(nextRows, 'nimproxy_lane_requests_total', 'lane');
-        const previousLanes = groups(previousNow.rows, 'nimproxy_lane_requests_total', 'lane');
-        nowLaneRates = new Map([...new Set([...currentLanes.keys(), ...previousLanes.keys()])].map(lane =>
-          [lane, rate(currentLanes.get(lane) || 0, previousLanes.get(lane) || 0,
-            next.sampled_at * 1000, previousNow.t)]));
-      }
-    }
-    previousNow = { t: next.sampled_at * 1000, rows: nextRows };
-    nowData = next;
-    nowRows = nextRows;
-    applyNowConfig(next);
-
-    if (!rangeData) {
-      await refreshSelectedRange();
-    } else if (mode.kind === 'following' && !mode.paused) {
-      if (historyChanged || (configChanged && mode.preset === 'default'))
-        await refreshSelectedRange();
-      else {
-        const bounds = followingBounds();
-        mode.from = bounds.from;
-        mode.to = bounds.to;
-        rebuildSamples();
-      }
-    }
-    render();
-    syncFollowControl();
-    $('uptime').textContent = 'up ' + ago(next.sampled_at - cfg.started);
+    await handleNowPayload(await response.json());
   } catch {
     syncFollowControl(true);
   } finally {
     pollingNow = false;
   }
 }
+
+async function handleNowPayload(next) {
+  const nextRows = next.metrics.map(asRow);
+  const historyChanged = rangeData && next.history_revision !== rangeData.history_revision;
+  const configChanged = nowData && next.config_revision !== nowData.config_revision;
+
+  if (previousNow) {
+    nowRpm = rate(sum(nextRows, 'nimproxy_requests_total'),
+      sum(previousNow.rows, 'nimproxy_requests_total'),
+      next.sampled_at * 1000, previousNow.t);
+    if (configChanged) {
+      nowLaneRates = new Map();
+    } else {
+      const currentLanes = groups(nextRows, 'nimproxy_lane_requests_total', 'lane');
+      const previousLanes = groups(previousNow.rows, 'nimproxy_lane_requests_total', 'lane');
+      nowLaneRates = new Map([...new Set([...currentLanes.keys(), ...previousLanes.keys()])].map(lane =>
+        [lane, rate(currentLanes.get(lane) || 0, previousLanes.get(lane) || 0,
+          next.sampled_at * 1000, previousNow.t)]));
+    }
+  }
+  previousNow = { t: next.sampled_at * 1000, rows: nextRows };
+  nowData = next;
+  nowRows = nextRows;
+  applyNowConfig(next);
+
+  if (!rangeData) {
+    await refreshSelectedRange();
+  } else if (mode.kind === 'following' && !mode.paused) {
+    if (historyChanged || (configChanged && mode.preset === 'default'))
+      await refreshSelectedRange();
+    else {
+      const bounds = followingBounds();
+      mode.from = bounds.from;
+      mode.to = bounds.to;
+      rebuildSamples();
+    }
+  }
+  render();
+  syncFollowControl();
+  $('uptime').textContent = 'up ' + ago(next.sampled_at - cfg.started);
+}
+
+function startSSE() {
+  if (sseSource) sseSource.close();
+  sseSource = new EventSource('/api/dashboard/stream');
+  sseSource.onmessage = async (event) => {
+    try {
+      await handleNowPayload(JSON.parse(event.data));
+    } catch (e) {
+      // ignore parse errors on SSE data
+    }
+  };
+  sseSource.onerror = () => {
+    sseSource.close();
+    sseSource = null;
+    if (!pollingNow) pollingInterval = setInterval(pollNow, POLL_MS);
+  };
+  clearInterval(pollingInterval);
+  pollingInterval = null;
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    if (sseSource) { sseSource.close(); sseSource = null; }
+  } else if (!sseSource) {
+    startSSE();
+  }
+});
 
 /* ---------- controls ---------- */
 for (const b of document.querySelectorAll('#ranges button')) {
@@ -3101,7 +3133,7 @@ $('theme-toggle').addEventListener('click', () => {
   $('to').value = toLocal(new Date());
   $('from').value = toLocal(new Date(Date.now() - 86400e3));
   await pollNow();
-  setInterval(pollNow, POLL_MS);
+  startSSE();
 })();
 </script>
 </body>

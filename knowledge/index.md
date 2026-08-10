@@ -39,6 +39,7 @@ the chronology in [log.md](log.md).
 | [graduated-backpressure](decisions/graduated-backpressure.md) | Estimate queue wait; accept under threshold (ETA header), reject at or above it (503 + Retry-After). Deadline requests exempt |
 | [multi-upstream-failover](decisions/multi-upstream-failover.md) | Ordered upstream list with passive health detection; fail over when the primary goes down, back when it recovers, zero extra RPM |
 | [capacity-simulator](decisions/capacity-simulator.md) | Pure-front-end what-if simulator in the Capacity tab; M/M/1 closed-form delay, seeded from a `/api/dashboard/capacity-model` endpoint |
+| [realtime-dashboard-sse](decisions/realtime-dashboard-sse.md) | Dashboard swaps 3s polling for a server-sent-events stream (full snapshots, v1); poll kept as fallback, bounded connections |
 
 ## Research — validated external facts
 

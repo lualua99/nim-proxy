@@ -27,12 +27,14 @@ use std::time::{Duration, Instant};
 
 use axum::extract::{DefaultBodyLimit, Extension, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::Router;
 use bytes::Bytes;
 use metrics::gauge;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use std::convert::Infallible;
 use tokio::sync::Mutex;
 
 use auth::{Admin, Identity};
@@ -140,6 +142,8 @@ pub struct AppState {
     pub config_revision: AtomicU64,
     /// Unix time this process started (dashboard uptime).
     pub started: u64,
+    /// Live SSE dashboard-stream connections; bounds memory under many tabs.
+    pub sse_connections: AtomicUsize,
 }
 
 impl AppState {
@@ -200,6 +204,9 @@ fn unix_now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+
+/// Max concurrent SSE dashboard-stream connections (per-process, not per-user).
+const MAX_SSE_CONNECTIONS: usize = 100;
 
 fn capacity_snapshot(pool: &Pool) -> history::CapacitySnapshot {
     history::CapacitySnapshot {
@@ -271,10 +278,7 @@ async fn api_dashboard(
     .into_response()
 }
 
-async fn api_dashboard_now(
-    State(state): State<Arc<AppState>>,
-    Extension(Identity(username)): Extension<Identity>,
-) -> axum::Json<serde_json::Value> {
+fn dashboard_now_payload(state: &AppState, username: &str) -> serde_json::Value {
     let stored = state.store.lock().unwrap();
     let config_revision = state
         .config_revision
@@ -283,7 +287,7 @@ async fn api_dashboard_now(
     let now = unix_now();
     let current = state.history.current(now, || state.prometheus.render());
     let history_revision = current.tail.base_history_revision;
-    let role = stored.user(&username).map(|u| match u.role {
+    let role = stored.user(username).map(|u| match u.role {
         Role::Superuser => "superuser",
         Role::Admin => "admin",
         Role::User => "user",
@@ -303,11 +307,6 @@ async fn api_dashboard_now(
             })
         })
         .collect();
-    // Window occupancy: the sum of each lane's actual sends inside the
-    // sliding rate window, vs the sum of its calibrated admission budget.
-    // This is decoupled from the 3s poll delta / instantaneous RPM that feeds
-    // the throughput readouts, so the "Capacity used · Now" ring shows real
-    // window fill instead of a rate extrapolation that inflates low traffic.
     let lane_stats = pool.lane_stats();
     let per_lane: Vec<serde_json::Value> = lane_stats
         .iter()
@@ -326,7 +325,7 @@ async fn api_dashboard_now(
         .iter()
         .map(|l| (l.rpm as f64 * l.cal_factor).floor().max(1.0) as usize)
         .sum();
-    axum::Json(serde_json::json!({
+    serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "sampled_at": now,
         "started": state.started,
@@ -357,7 +356,59 @@ async fn api_dashboard_now(
         "upstream_health": upstream_health,
         "metrics": current.metrics,
         "tail": current.tail,
-    }))
+    })
+}
+
+async fn api_dashboard_now(
+    State(state): State<Arc<AppState>>,
+    Extension(Identity(username)): Extension<Identity>,
+) -> axum::Json<serde_json::Value> {
+    axum::Json(dashboard_now_payload(&state, &username))
+}
+
+async fn api_dashboard_stream(
+    State(state): State<Arc<AppState>>,
+    Extension(Identity(username)): Extension<Identity>,
+) -> Response {
+    let current = state
+        .sse_connections
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if current >= MAX_SSE_CONNECTIONS {
+        state
+            .sse_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too_many_streams",
+            "too many dashboard SSE connections",
+        );
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(4);
+    let state = state.clone();
+    let username = username.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let value = dashboard_now_payload(&state, &username);
+            let data = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned());
+            if tx.send(Ok(Event::default().data(data))).await.is_err() {
+                break;
+            }
+        }
+        state
+            .sse_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::default()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response()
 }
 
 /// Chronicle window for the capacity-model's "recent observation": the last
@@ -934,6 +985,7 @@ pub async fn run() {
         prometheus,
         config_revision: AtomicU64::new(1),
         started: unix_now(),
+        sse_connections: AtomicUsize::new(0),
         store: std::sync::Mutex::new(stored),
         data_dir,
         setup_required: std::sync::atomic::AtomicBool::new(setup_required),
@@ -990,6 +1042,7 @@ pub async fn run() {
         .route("/dash", get(dash))
         .route("/api/dashboard", get(api_dashboard))
         .route("/api/dashboard/now", get(api_dashboard_now))
+        .route("/api/dashboard/stream", get(api_dashboard_stream))
         .route("/api/dashboard/capacity-model", get(api_capacity_model))
         .route("/api/models", get(proxy::api_models))
         .route("/api/queue", get(api_queue))

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Realtime dashboard push over SSE**: the dashboard now uses a Server-Sent
+  Events stream (`GET /api/dashboard/stream`) for its 3-second Now-data updates
+  instead of polling `/api/dashboard/now`. The new endpoint is session-gated
+  (under `require_session`) and bounded to 100 concurrent connections. The
+  existing poll endpoint is kept as a fallback — if the SSE connection drops,
+  the dashboard reverts to polling transparently. A `visibilitychange` handler
+  closes the stream when the tab is hidden and reopens it on return.
+  See [todo/13-realtime-dashboard-push.md](todo/13-realtime-dashboard-push.md).
+
 - **Capacity used · Now ring gauge switched to window occupancy**: the
   Overview ring chart now shows real slot fill (`window_fill / window_capacity`)
   instead of a rate extrapolation from the 3s poll delta. A single request
