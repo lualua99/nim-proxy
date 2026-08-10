@@ -31,6 +31,21 @@ pub fn commit(
         let mut pool = state.pool.write().unwrap();
         *pool = Arc::new(pool.rebuild(candidate.pool_specs()));
     }
+    // Rebuild the upstream selector from the new endpoint list so health
+    // state tracks the current upstream set.
+    state
+        .upstream_selector
+        .lock()
+        .unwrap()
+        .rebuild(candidate.upstream.endpoints());
+    // Rate state moved (windows/calibration/benches): ask the rate-state
+    // saver to persist the new snapshot promptly, not on its next 30s tick.
+    state
+        .ratestate_dirty
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // Scheduling policy is runtime state the dispatcher owns; apply the
+    // candidate alongside the cfg swap so the next queued pick obeys it.
+    state.dispatch.configure(&candidate.dispatch);
     if candidate.history.days != guard.history.days {
         state
             .history
@@ -257,7 +272,7 @@ pub async fn probe_key(http: &reqwest::Client, base_url: &str, key: &str) -> Res
 use axum::Extension;
 
 use crate::auth::Identity;
-use crate::config::{ClientKey, Mode};
+use crate::config::{ClientKey, DispatchPolicy, Mode};
 
 /// First 8 hex chars of SHA-256(key): the stable public identifier for a
 /// stored NIM key (the value itself is never sent back to a browser).
@@ -391,6 +406,7 @@ pub async fn api_config(
         let history = state.history.status();
         body["server"] = serde_json::json!({
             "base_url": sc.upstream.base_url,
+            "upstreams": sc.upstream.upstreams,
             "limits": sc.limits,
             "pricing": sc.pricing,
             "history": {
@@ -401,6 +417,8 @@ pub async fn api_config(
             },
             "dashboard": sc.dashboard,
             "governor": sc.governor,
+            "recovery": sc.recovery,
+            "dispatch": sc.dispatch,
         });
         body["users"] = serde_json::json!(sc
             .users
@@ -597,10 +615,14 @@ macro_rules! admin_section {
 #[derive(Deserialize)]
 pub struct UpstreamReq {
     base_url: String,
+    #[serde(default)]
+    upstreams: Vec<String>,
 }
 
-/// `POST /api/settings/upstream` (admin) — also flushes the model-catalog
-/// cache and the per-model no-inject memory, which are upstream-specific.
+/// `POST /api/settings/upstream` (admin) — set the base URL and the
+/// ordered upstream endpoint list. An empty list means single-endpoint
+/// mode (backward compatible). Also flushes the model-catalog cache and
+/// the per-model no-inject memory, which are upstream-specific.
 pub async fn upstream(
     State(state): State<Arc<AppState>>,
     Extension(Identity(username)): Extension<Identity>,
@@ -615,6 +637,11 @@ pub async fn upstream(
         }
         let mut cand = guard.clone();
         cand.upstream.base_url = req.base_url.trim().trim_end_matches('/').to_owned();
+        cand.upstream.upstreams = req
+            .upstreams
+            .into_iter()
+            .map(|u| u.trim().trim_end_matches('/').to_owned())
+            .collect();
         commit(&state, &mut guard, cand)
     };
     match result {
@@ -638,6 +665,8 @@ pub struct LimitsReq {
     request_timeout_secs: u64,
     max_inflight: usize,
     strict_passthrough: bool,
+    backpressure_enabled: bool,
+    backpressure_queue_threshold_eta_secs: u64,
 }
 
 admin_section!(
@@ -652,6 +681,8 @@ admin_section!(
             request_timeout_secs: req.request_timeout_secs,
             max_inflight: req.max_inflight,
             strict_passthrough: req.strict_passthrough,
+            backpressure_enabled: req.backpressure_enabled,
+            backpressure_queue_threshold_eta_secs: req.backpressure_queue_threshold_eta_secs,
         };
     }
 );
@@ -689,6 +720,21 @@ admin_section!(
 );
 
 #[derive(Deserialize)]
+pub struct RecoveryReq {
+    ramp_secs: u64,
+    ramp_factor: f64,
+}
+
+admin_section!(
+    recovery,
+    RecoveryReq,
+    |cand: &mut StoredConfig, req: RecoveryReq| {
+        cand.recovery.ramp_secs = req.ramp_secs;
+        cand.recovery.ramp_factor = req.ramp_factor;
+    }
+);
+
+#[derive(Deserialize)]
 pub struct GovernorReq {
     enabled: Option<bool>,
     set_override: Option<GovernorOverride>,
@@ -716,6 +762,54 @@ admin_section!(
         }
     }
 );
+
+/// Slot-scheduling settings: which policy (fifo/edf/fair), the fair-mode
+/// anti-starvation bound, and per-client fair-mode weight overrides.
+#[derive(Deserialize)]
+pub struct DispatchReq {
+    policy: Option<String>,
+    fair_aging_secs: Option<u64>,
+    set_weight: Option<(String, usize)>,
+    remove_weight: Option<String>,
+}
+
+/// `POST /api/settings/dispatch` (admin) — swap slot scheduling live. Only
+/// the given fields change; `policy` and `fair_aging_secs` map 1:1 to the
+/// store, weights are edited per client.
+pub async fn dispatch_cfg(
+    State(state): State<Arc<AppState>>,
+    Extension(Identity(username)): Extension<Identity>,
+    axum::Json(req): axum::Json<DispatchReq>,
+) -> Response {
+    let mut guard = state.store.lock().unwrap();
+    match role_of(&guard, &username) {
+        Some(r) if r.is_admin() => {}
+        Some(_) => return forbidden("server settings require an admin"),
+        None => return stale_session(),
+    }
+    let mut cand = guard.clone();
+    if let Some(p) = req.policy {
+        cand.dispatch.policy = match p.as_str() {
+            "fifo" => DispatchPolicy::Fifo,
+            "edf" => DispatchPolicy::Edf,
+            "fair" => DispatchPolicy::Fair,
+            _ => return bad_request("policy must be \"fifo\", \"edf\" or \"fair\""),
+        };
+    }
+    if let Some(a) = req.fair_aging_secs {
+        cand.dispatch.fair_aging_secs = a;
+    }
+    if let Some((client, weight)) = req.set_weight {
+        cand.dispatch.fair_weights.insert(client, weight);
+    }
+    if let Some(client) = req.remove_weight {
+        cand.dispatch.fair_weights.remove(&client);
+    }
+    match commit(&state, &mut guard, cand) {
+        Ok(()) => ok_json(serde_json::json!({"ok": true})),
+        Err(e) => bad_request(e),
+    }
+}
 
 #[derive(Deserialize)]
 pub struct UsersReq {

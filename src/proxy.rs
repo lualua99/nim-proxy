@@ -140,6 +140,28 @@ fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
         .and_then(|s| s.parse::<u64>().ok())
 }
 
+/// Select an upstream URL from the health-based selector, falling back to
+/// `cfg.base_url` if the selector returns nothing (empty config, shouldn't
+/// happen — validation requires >= 1 endpoint).
+fn select_upstream(state: &Arc<AppState>, cfg: &Config) -> String {
+    state
+        .upstream_selector
+        .lock()
+        .unwrap()
+        .select()
+        .unwrap_or_else(|| cfg.base_url.clone())
+}
+
+/// Report an upstream exchange outcome to the health selector.
+fn observe_upstream(state: &Arc<AppState>, url: &str, success: bool) {
+    let mut sel = state.upstream_selector.lock().unwrap();
+    if success {
+        sel.observe_success(url);
+    } else {
+        sel.observe_failure(url);
+    }
+}
+
 /// What a retryable upstream status means for the lane's calibration:
 /// 429s carry the lockout runway (`Retry-After`), other retryables are
 /// plain server-side strain.
@@ -153,7 +175,7 @@ fn upstream_signal(resp: &reqwest::Response) -> Option<Signal> {
     }
 }
 
-/// Join the global FIFO queue for a rate-limit slot, invoking `on_wait` every
+/// Join the global slot queue for a rate-limit slot, invoking `on_wait` every
 /// heartbeat interval so streaming callers can keep their client alive.
 /// Returns None if the queue rejects us (no slot before the deadline) or
 /// `on_wait` reports the client is gone.
@@ -162,10 +184,11 @@ async fn reserve_slot(
     heartbeat: Duration,
     deadline: Instant,
     prefer: Option<usize>,
+    client: &str,
     mut on_wait: impl FnMut() -> bool,
 ) -> Option<Slot> {
     let queued = Instant::now();
-    let mut rx = state.dispatch.acquire(deadline, prefer);
+    let mut rx = state.dispatch.acquire(deadline, prefer, client.to_owned());
     loop {
         tokio::select! {
             slot = &mut rx => {
@@ -479,14 +502,12 @@ impl SseScan {
 
 fn upstream_request(
     http: &reqwest::Client,
-    base_url: &str,
+    url: &str,
     method: &Method,
-    path_query: &str,
     headers: &HeaderMap,
     key: &str,
     body: &Bytes,
 ) -> reqwest::RequestBuilder {
-    let url = format!("{base_url}{path_query}");
     let mut req = http
         .request(method.clone(), url)
         .header(header::AUTHORIZATION, format!("Bearer {key}"));
@@ -661,8 +682,36 @@ pub async fn handle(
         }
     }
 
+    // Backpressure gate: if the estimated queue wait exceeds the threshold,
+    // reject immediately with 503 + Retry-After instead of letting the request
+    // queue. Requests carrying an explicit deadline are exempt — they already
+    // have a binding bound and dropping them would deny their only path.
+    let backpressure_eta = if cfg.backpressure_enabled && request_deadline.is_none() {
+        state.dispatch.eta(prefer)
+    } else {
+        None
+    };
+    let backpressure_reject =
+        backpressure_eta.filter(|eta| *eta >= cfg.backpressure_queue_threshold_eta);
+
+    if let Some(eta) = backpressure_reject {
+        counter!("nimproxy_backpressure_total", "kind" => "reject").increment(1);
+        histogram!("nimproxy_backpressure_rejected_eta_seconds").record(eta.as_secs_f64());
+        return backpressure_rejected(eta);
+    }
+
     if wants_stream {
-        let wait_deadline = wait_deadline(&cfg);
+        // The queue deadline is the earlier of the patient default and an
+        // explicit `X-Nim-Proxy-Deadline-Ms` — under EDF that blend is the
+        // ordering key; under every policy a header-deadline request stops
+        // queueing when its own bound lapses instead of parking until
+        // `max_wait`. Queued that long is worthless: the wrapper cancels the
+        // whole future at the header deadline anyway.
+        let wait = wait_deadline(&cfg);
+        let deadline = match request_deadline {
+            Some(rd) => rd.0.min(wait),
+            None => wait,
+        };
         streaming(
             state,
             cfg,
@@ -675,11 +724,16 @@ pub async fn handle(
             fallback,
             inflight_guard,
             request_deadline,
-            wait_deadline,
+            deadline,
             registered,
+            backpressure_eta,
         )
     } else {
-        let wait_deadline = wait_deadline(&cfg);
+        let wait = wait_deadline(&cfg);
+        let deadline = match request_deadline {
+            Some(rd) => rd.0.min(wait),
+            None => wait,
+        };
         let deadline_ctx = ctx.clone();
         let work = buffered(
             state,
@@ -690,7 +744,8 @@ pub async fn handle(
             headers,
             body,
             prefer,
-            wait_deadline,
+            deadline,
+            request_deadline,
             registered,
         );
         if let Some(deadline) = request_deadline {
@@ -725,6 +780,36 @@ fn affinity(body: &serde_json::Value, lanes: usize) -> Option<usize> {
     Some((h.finish() % lanes as u64) as usize)
 }
 
+/// The dispatcher's fail-fast flavor when a request's queue bound lapses:
+/// an explicit `X-Nim-Proxy-Deadline-Ms` that IS the binding bound (it was
+/// folded into the queue deadline) reads as "deadline exceeded"; a pure
+/// default-wait expiry reads as the saturated-slot timeout. `on_deadline`
+/// / `on_wait` produce the two responses (JSON or in-stream SSE).
+fn queue_expired_flavor(
+    request_deadline: Option<RequestDeadline>,
+    deadline: Instant,
+    on_deadline: impl FnOnce() -> Response,
+    on_wait: impl FnOnce() -> Response,
+) -> Response {
+    match request_deadline {
+        Some(rd) if rd.0 <= deadline => on_deadline(),
+        _ => on_wait(),
+    }
+}
+
+/// Bytes twin of [`queue_expired_flavor`] for in-stream SSE payloads.
+fn queue_expired_sse(
+    request_deadline: Option<RequestDeadline>,
+    deadline: Instant,
+    on_deadline: impl FnOnce() -> Bytes,
+    on_wait: impl FnOnce() -> Bytes,
+) -> Bytes {
+    match request_deadline {
+        Some(rd) if rd.0 <= deadline => on_deadline(),
+        _ => on_wait(),
+    }
+}
+
 /// Non-streaming: pace, retry, and return the upstream response verbatim.
 #[allow(clippy::too_many_arguments)]
 async fn buffered(
@@ -737,6 +822,7 @@ async fn buffered(
     body: Bytes,
     prefer: Option<usize>,
     deadline: Instant,
+    request_deadline: Option<RequestDeadline>,
     registered: Registered,
 ) -> Response {
     let _active = crate::dispatch::scopeguard(|| gauge!("nimproxy_active_requests").decrement(1.0));
@@ -746,7 +832,7 @@ async fn buffered(
     let _leave = registered;
     let term_ctx = ctx.clone();
     // The paced/retrying loop, so a kill lands even while this request waits
-    // in the governor, the FIFO queue, or an upstream retry backoff.
+    // in the governor, the slot queue, or an upstream retry backoff.
     let work = async move {
         loop {
             // Two admission gates: a model-pressure permit (worker concurrency,
@@ -756,23 +842,44 @@ async fn buffered(
             let Ok(_permit) = acquire_model_permit(&state, &cfg, &ctx, deadline, || true).await
             else {
                 record_request(&ctx, "504");
-                return gateway_timeout(&cfg, state.pool().len());
+                return queue_expired_flavor(
+                    request_deadline,
+                    deadline,
+                    || {
+                        record_deadline(&ctx);
+                        deadline_exceeded()
+                    },
+                    || gateway_timeout(&cfg, state.pool().len()),
+                );
             };
             state.registry.set_phase(id, "waiting_slot");
-            let Some(slot) = reserve_slot(&state, cfg.heartbeat, deadline, prefer, || true).await
+            let Some(slot) =
+                reserve_slot(&state, cfg.heartbeat, deadline, prefer, &ctx.client, || {
+                    true
+                })
+                .await
             else {
                 record_request(&ctx, "504");
-                return gateway_timeout(&cfg, state.pool().len());
+                return queue_expired_flavor(
+                    request_deadline,
+                    deadline,
+                    || {
+                        record_deadline(&ctx);
+                        deadline_exceeded()
+                    },
+                    || gateway_timeout(&cfg, state.pool().len()),
+                );
             };
             state.registry.set_phase(id, "upstream");
+            let upstream_base = select_upstream(&state, &cfg);
+            let url = format!("{upstream_base}{path_query}");
             let sent_at = Instant::now();
             // A non-streaming request gets an overall timeout so a stalled body read
             // can't pin an in-flight slot forever (streaming has no such cap).
             let resp = match upstream_request(
                 &state.http,
-                &cfg.base_url,
+                &url,
                 &method,
-                &path_query,
                 &headers,
                 &slot.key,
                 &body,
@@ -785,6 +892,7 @@ async fn buffered(
                 Err(e) => {
                     tracing::warn!(lane = slot.lane, error = %e, "upstream connection error, retrying");
                     bench(&slot, "connect", Duration::from_secs(5), None);
+                    observe_upstream(&state, &upstream_base, false);
                     continue;
                 }
             };
@@ -796,16 +904,19 @@ async fn buffered(
                 // across every key), so benching the lane would just burn healthy
                 // key capacity on a failover that cannot help.
                 let detail = resp.text().await.unwrap_or_default();
+                observe_upstream(&state, &upstream_base, false);
                 if governor::is_worker_exhausted(&detail) {
-                    state
-                        .governor
-                        .note_exhausted(&ctx.model, cfg.governor.overrides.get(&ctx.model).copied());
+                    state.governor.note_exhausted(
+                        &ctx.model,
+                        cfg.governor.overrides.get(&ctx.model).copied(),
+                    );
                     continue; // permit drops here; re-admission waits out the drain
                 }
                 tracing::info!(lane = slot.lane, %status, ?backoff, "lane benched, retrying");
                 bench(&slot, status.as_str(), backoff, signal);
                 continue;
             }
+            observe_upstream(&state, &upstream_base, resp.status().is_success());
             histogram!("nimproxy_upstream_seconds", "model" => ctx.model.clone())
                 .record(sent_at.elapsed().as_secs_f64());
             record_request(&ctx, resp.status().as_str());
@@ -839,6 +950,7 @@ fn streaming(
     request_deadline: Option<RequestDeadline>,
     deadline: Instant,
     registered: Registered,
+    backpressure_eta: Option<Duration>,
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
 
@@ -880,35 +992,54 @@ fn streaming(
                 else {
                     record_request(&ctx, "504");
                     let _ = tx
-                        .send(Ok(sse_error(
-                            "proxy timed out waiting for an upstream slot",
+                        .send(Ok(queue_expired_sse(
+                            request_deadline,
+                            deadline,
+                            || {
+                                sse_error_with_code(
+                                    "deadline_exceeded",
+                                    "proxy request deadline exceeded",
+                                )
+                            },
+                            || sse_error("proxy timed out waiting for an upstream slot"),
                         )))
                         .await;
                     return;
                 };
                 state.registry.set_phase(id, "waiting_slot");
-                let slot = reserve_slot(&state, cfg.heartbeat, deadline, prefer, || {
-                    tx.try_send(Ok(Bytes::from_static(b": heartbeat\n\n")))
-                        .is_ok()
-                })
-                .await;
+                let slot =
+                    reserve_slot(&state, cfg.heartbeat, deadline, prefer, &ctx.client, || {
+                        tx.try_send(Ok(Bytes::from_static(b": heartbeat\n\n")))
+                            .is_ok()
+                    })
+                    .await;
                 let Some(slot) = slot else {
                     record_request(&ctx, "504");
                     let _ = tx
-                        .send(Ok(sse_error(
-                            "proxy timed out waiting for an upstream slot",
+                        .send(Ok(queue_expired_sse(
+                            request_deadline,
+                            deadline,
+                            || {
+                                sse_error_with_code(
+                                    "deadline_exceeded",
+                                    "proxy request deadline exceeded",
+                                )
+                            },
+                            || sse_error("proxy timed out waiting for an upstream slot"),
                         )))
                         .await;
                     return;
                 };
                 state.registry.set_phase(id, "upstream");
 
+                let upstream_base = select_upstream(&state, &cfg);
+                let url = format!("{upstream_base}{path_query}");
+
                 let sent_at = Instant::now();
                 let resp = match upstream_request(
                     &state.http,
-                    &cfg.base_url,
+                    &url,
                     &method,
-                    &path_query,
                     &headers,
                     &slot.key,
                     &body,
@@ -920,6 +1051,7 @@ fn streaming(
                     Err(e) => {
                         tracing::warn!(lane = slot.lane, error = %e, "upstream connection error, retrying");
                         bench(&slot, "connect", Duration::from_secs(5), None);
+                        observe_upstream(&state, &upstream_base, false);
                         continue;
                     }
                 };
@@ -930,6 +1062,7 @@ fn streaming(
                     tracing::info!(model = %ctx.model, "model rejected stream_options; retrying without injection");
                     state.no_inject.lock().unwrap().insert(ctx.model.clone());
                     body = fallback.take().unwrap();
+                    observe_upstream(&state, &upstream_base, false);
                     continue;
                 }
 
@@ -947,6 +1080,7 @@ fn streaming(
                     // Worker exhaustion is model-scoped: back off the model via
                     // the governor, never the lane (see `buffered`).
                     let detail = resp.text().await.unwrap_or_default();
+                    observe_upstream(&state, &upstream_base, false);
                     if governor::is_worker_exhausted(&detail) {
                         state.governor.note_exhausted(
                             &ctx.model,
@@ -970,12 +1104,14 @@ fn streaming(
                     let detail = resp.text().await.unwrap_or_default();
                     tracing::warn!(%status, "upstream rejected request");
                     record_request(&ctx, status.as_str());
+                    observe_upstream(&state, &upstream_base, false);
                     let _ = tx
                         .send(Ok(sse_error(&format!("upstream error {status}: {detail}"))))
                         .await;
                     return;
                 }
 
+                observe_upstream(&state, &upstream_base, true);
                 let mut scan = SseScan::default();
                 let mut first_chunk: Option<Instant> = None;
                 let mut chunks = resp.bytes_stream();
@@ -1101,10 +1237,15 @@ fn streaming(
         }
     });
 
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CACHE_CONTROL, "no-cache");
+    if let Some(eta) = backpressure_eta {
+        counter!("nimproxy_backpressure_total", "kind" => "eta").increment(1);
+        builder = builder.header("X-Nim-Proxy-Eta", eta.as_secs().to_string());
+    }
+    builder
         .body(Body::from_stream(ReceiverStream::new(rx)))
         .unwrap()
 }
@@ -1161,10 +1302,13 @@ async fn catalog(
         }
     }
     let deadline = Instant::now() + Duration::from_secs(30);
-    let Some(slot) = reserve_slot(&state, cfg.heartbeat, deadline, None, || true).await else {
+    // The catalog probe has no client identity — it's internal traffic.
+    let Some(slot) = reserve_slot(state, cfg.heartbeat, deadline, None, "proxy", || true).await
+    else {
         return Err(CatalogError::Unavailable(state.pool().len()));
     };
-    match fetch_models(&state.http, &cfg.base_url, &slot.key).await {
+    let upstream_url = select_upstream(state, cfg);
+    match fetch_models(&state.http, &upstream_url, &slot.key).await {
         Ok(resp) if resp.status().is_success() => {
             let body = resp.bytes().await.unwrap_or_default();
             let cached_at = SystemTime::now()
@@ -1172,6 +1316,7 @@ async fn catalog(
                 .unwrap_or_default()
                 .as_secs();
             *cache = Some((Instant::now(), body.clone()));
+            observe_upstream(state, &upstream_url, true);
             Ok(Catalog {
                 body,
                 cached_at,
@@ -1185,6 +1330,7 @@ async fn catalog(
                 let signal = upstream_signal(&resp);
                 bench(&slot, status.as_str(), backoff, signal);
             }
+            observe_upstream(state, &upstream_url, false);
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let body = resp.bytes().await.unwrap_or_default();
@@ -1192,6 +1338,7 @@ async fn catalog(
         }
         Err(e) => {
             tracing::warn!(error = %e, "models fetch failed");
+            observe_upstream(state, &upstream_url, false);
             Err(CatalogError::Unavailable(state.pool().len()))
         }
     }
@@ -1415,6 +1562,18 @@ fn overloaded(max_inflight: usize) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         [(header::RETRY_AFTER, "5")],
+        axum::Json(body),
+    )
+        .into_response()
+}
+
+fn backpressure_rejected(eta: Duration) -> Response {
+    let secs = eta.as_secs().max(1);
+    let body = proxy_error_json("backpressure", format!("queue full; retry after {secs} s"));
+    let retry = header::HeaderValue::from_str(&secs.to_string()).unwrap();
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, retry)],
         axum::Json(body),
     )
         .into_response()

@@ -62,6 +62,17 @@ pub struct Governor {
     models: Mutex<HashMap<String, ModelState>>,
 }
 
+/// Per-model state snapshot for the dashboard capacity-model endpoint.
+pub struct ModelView {
+    pub model: String,
+    /// Current concurrency cap (0 = ungoverned).
+    pub limit: usize,
+    /// Requests currently in flight upstream.
+    pub inflight: usize,
+    /// True if new admissions are temporarily blocked (post-exhaustion drain).
+    pub blocked: bool,
+}
+
 /// A held admission: the request is (about to be) in flight on this model.
 /// Dropping it releases the slot on every exit path.
 pub struct ModelPermit {
@@ -76,6 +87,58 @@ impl Drop for ModelPermit {
 }
 
 impl Governor {
+    /// A governor resuming persisted caps after a restart. Only non-zero
+    /// caps restore (0 = ungoverned is the default, not a fact worth
+    /// remembering); restored models carry no lifecycle history, so
+    /// adaptation resumes cleanly on the next exhaustion.
+    pub fn restored(limits: &HashMap<String, usize>) -> Self {
+        let models = limits
+            .iter()
+            .filter(|(_, cap)| cap > &&0)
+            .map(|(model, cap)| {
+                (
+                    model.clone(),
+                    ModelState {
+                        limit: *cap,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        Self {
+            models: Mutex::new(models),
+        }
+    }
+
+    /// The caps a restart should remember (models with a non-zero cap).
+    pub fn limits(&self) -> HashMap<String, usize> {
+        self.models
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.limit > 0)
+            .map(|(m, s)| (m.clone(), s.limit))
+            .collect()
+    }
+
+    /// Point-in-time per-model view for the capacity what-if simulator. Unlike
+    /// [`Governor::limits`], this includes ungoverned models (limit = 0) and
+    /// the current in-flight count, so the dashboard can show the live gate.
+    pub fn view(&self) -> Vec<ModelView> {
+        let now = Instant::now();
+        self.models
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(model, s)| ModelView {
+                model: model.clone(),
+                limit: s.limit,
+                inflight: s.inflight,
+                blocked: s.blocked_until.is_some_and(|b| b > now),
+            })
+            .collect()
+    }
+
     /// Try to admit a request on `model`; returns a permit or None when the
     /// model is at its cap / draining after an exhaustion.
     pub fn admit(
@@ -292,5 +355,28 @@ mod tests {
         g.note_exhausted_at("hot", None, now);
         // The untouched model admits freely during hot's drain gap.
         admit_n(&g, "cold", 50, now);
+    }
+
+    #[test]
+    fn caps_survive_a_restart_roundtrip() {
+        let g = gov();
+        let now = Instant::now();
+        admit_n(&g, "hot", 4, now);
+        g.note_exhausted_at("hot", None, now); // engages limit 2
+        let limits = g.limits();
+        assert_eq!(limits.get("hot"), Some(&2));
+        assert!(
+            !limits.contains_key("cold"),
+            "ungoverned models are not persisted"
+        );
+        let resumed = Governor::restored(&limits);
+        // The cap holds immediately, no lifecycle step required.
+        assert!(resumed.admit_at("hot", None, now));
+        assert!(resumed.admit_at("hot", None, now));
+        assert!(
+            !resumed.admit_at("hot", None, now),
+            "restored cap of 2 holds"
+        );
+        admit_n(&resumed, "cold", 50, now + EXHAUST_BACKOFF);
     }
 }

@@ -41,6 +41,10 @@ pub struct StoredConfig {
     #[serde(default)]
     pub governor: GovernorCfg,
     #[serde(default)]
+    pub recovery: RecoveryCfg,
+    #[serde(default)]
+    pub dispatch: DispatchCfg,
+    #[serde(default)]
     pub users: Vec<User>,
 }
 
@@ -54,6 +58,11 @@ impl Default for StoredConfig {
 pub struct Upstream {
     #[serde(default = "default_base_url")]
     pub base_url: String,
+    /// Ordered upstream endpoint list (priority = order). Empty means "use
+    /// `base_url` only" — a single-endpoint deployment is the migration
+    /// target for stores written before the list existed.
+    #[serde(default)]
+    pub upstreams: Vec<String>,
     #[serde(default)]
     pub nim_keys: Vec<NimKey>,
 }
@@ -62,7 +71,24 @@ impl Default for Upstream {
     fn default() -> Self {
         Self {
             base_url: default_base_url(),
+            upstreams: Vec::new(),
             nim_keys: Vec::new(),
+        }
+    }
+}
+
+impl Upstream {
+    /// The effective endpoint list, trimming trailing slashes and falling
+    /// back to `[base_url]` for backward-compatible single-endpoint stores.
+    /// Never empty (validation guarantees `base_url` is valid).
+    pub fn endpoints(&self) -> Vec<String> {
+        if self.upstreams.is_empty() {
+            vec![self.base_url.trim_end_matches('/').to_owned()]
+        } else {
+            self.upstreams
+                .iter()
+                .map(|u| u.trim().trim_end_matches('/').to_owned())
+                .collect()
         }
     }
 }
@@ -125,6 +151,10 @@ pub struct Limits {
     pub max_inflight: usize,
     #[serde(default)]
     pub strict_passthrough: bool,
+    #[serde(default)]
+    pub backpressure_enabled: bool,
+    #[serde(default = "default_backpressure_threshold")]
+    pub backpressure_queue_threshold_eta_secs: u64,
 }
 
 impl Default for Limits {
@@ -201,6 +231,90 @@ impl Default for GovernorCfg {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RecoveryCfg {
+    /// Seconds of slow-start after a restart that restored rate state;
+    /// 0 = off.
+    #[serde(default = "default_ramp_secs")]
+    pub ramp_secs: u64,
+    /// Fraction of the configured rpm admissible during the slow-start
+    /// window (0 < f <= 1).
+    #[serde(default = "default_ramp_factor")]
+    pub ramp_factor: f64,
+}
+
+impl Default for RecoveryCfg {
+    fn default() -> Self {
+        Self {
+            ramp_secs: default_ramp_secs(),
+            ramp_factor: default_ramp_factor(),
+        }
+    }
+}
+
+fn default_ramp_secs() -> u64 {
+    60
+}
+
+fn default_ramp_factor() -> f64 {
+    0.7
+}
+
+/// Slot-scheduling policy for the rate-limit dispatcher. `Fifo` is the
+/// historical behavior (strict arrival order); `Edf` serves the earliest
+/// queue deadline first (requests with an explicit
+/// `X-Nim-Proxy-Deadline-Ms` jump the line); `Fair` rotates per-client slot
+/// quotas with wait-aging so no client can starve another.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DispatchPolicy {
+    #[default]
+    Fifo,
+    Edf,
+    Fair,
+}
+
+impl DispatchPolicy {
+    /// The enum as a metric/config label ("fifo" | "edf" | "fair").
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DispatchPolicy::Fifo => "fifo",
+            DispatchPolicy::Edf => "edf",
+            DispatchPolicy::Fair => "fair",
+        }
+    }
+}
+
+impl std::fmt::Display for DispatchPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DispatchCfg {
+    #[serde(default)]
+    pub policy: DispatchPolicy,
+    /// Waiters older than this are served at highest priority under `Fair`
+    /// (the anti-starvation bound).
+    #[serde(default = "default_fair_aging")]
+    pub fair_aging_secs: u64,
+    /// Per-client weight overrides for `Fair` (client name -> weight). Absent
+    /// clients get a stable hash-derived weight.
+    #[serde(default)]
+    pub fair_weights: HashMap<String, usize>,
+}
+
+impl Default for DispatchCfg {
+    fn default() -> Self {
+        Self {
+            policy: DispatchPolicy::Fifo,
+            fair_aging_secs: default_fair_aging(),
+            fair_weights: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct User {
     pub username: String,
     /// `pbkdf2-sha256$<iters>$<salt>$<hash>` (see `auth::hash_password`).
@@ -269,6 +383,12 @@ fn default_dashboard_window_days() -> u64 {
 fn default_slo_target_percent() -> f64 {
     99.9
 }
+fn default_fair_aging() -> u64 {
+    60
+}
+fn default_backpressure_threshold() -> u64 {
+    20
+}
 
 impl StoredConfig {
     pub fn superuser(&self) -> Option<&User> {
@@ -297,6 +417,7 @@ impl StoredConfig {
     pub fn runtime(&self) -> crate::Config {
         crate::Config {
             base_url: self.upstream.base_url.trim_end_matches('/').to_owned(),
+            upstreams: self.upstream.endpoints(),
             max_wait: Duration::from_secs(self.limits.max_wait_secs),
             heartbeat: Duration::from_secs(self.limits.heartbeat_secs),
             models_ttl: Duration::from_secs(self.limits.models_ttl_secs),
@@ -316,6 +437,10 @@ impl StoredConfig {
                 ),
             },
             max_inflight: self.limits.max_inflight,
+            backpressure_enabled: self.limits.backpressure_enabled,
+            backpressure_queue_threshold_eta: Duration::from_secs(
+                self.limits.backpressure_queue_threshold_eta_secs,
+            ),
             governor: crate::GovernorSettings {
                 enabled: self.governor.enabled,
                 overrides: self.governor.overrides.clone(),
@@ -443,6 +568,9 @@ pub fn validate(sc: &StoredConfig) -> Result<(), String> {
     if l.max_inflight == 0 {
         return Err("max_inflight must be >= 1".into());
     }
+    if l.backpressure_queue_threshold_eta_secs == 0 {
+        return Err("backpressure_queue_threshold_eta_secs must be >= 1".into());
+    }
     if !sc.pricing.ref_price_in.is_finite()
         || !sc.pricing.ref_price_out.is_finite()
         || sc.pricing.ref_price_in < 0.0
@@ -463,6 +591,9 @@ pub fn validate(sc: &StoredConfig) -> Result<(), String> {
         return Err("slo_target_percent must be a number greater than 0 and at most 100".into());
     }
     check_base_url(&sc.upstream.base_url)?;
+    for url in &sc.upstream.upstreams {
+        check_base_url(url)?;
+    }
 
     let mut names = std::collections::HashSet::new();
     for u in &sc.users {
@@ -526,6 +657,28 @@ pub fn validate(sc: &StoredConfig) -> Result<(), String> {
             return Err(format!(
                 "governor override for {model:?} out of range 1-10000"
             ));
+        }
+    }
+
+    if sc.recovery.ramp_secs > 3600 {
+        return Err("recovery ramp_secs must be 0..=3600".into());
+    }
+    if !(0.0 < sc.recovery.ramp_factor && sc.recovery.ramp_factor <= 1.0) {
+        return Err("recovery ramp_factor must be in (0, 1]".into());
+    }
+
+    if sc.dispatch.fair_aging_secs == 0 {
+        return Err("fair_aging_secs must be >= 1".into());
+    }
+    for (client, weight) in &sc.dispatch.fair_weights {
+        if !label_ok(client, 64) {
+            return Err(format!(
+                "fair weight client {:?} must be 1-64 chars of letters, digits, '.', '_' or '-'",
+                client
+            ));
+        }
+        if !(1..=1000).contains(weight) {
+            return Err(format!("fair weight for {client:?} must be 1-1000"));
         }
     }
 
@@ -594,6 +747,7 @@ mod tests {
             }],
             upstream: Upstream {
                 base_url: default_base_url(),
+                upstreams: Vec::new(),
                 nim_keys: vec![NimKey {
                     key: "nvapi-one".into(),
                     owner: "root".into(),
@@ -701,6 +855,41 @@ mod tests {
         assert_eq!(k.rpm, 40);
         let g: GovernorCfg = serde_json::from_str("{}").unwrap();
         assert!(g.enabled);
+        let d: DispatchCfg = serde_json::from_str("{}").unwrap();
+        assert_eq!(d.policy, DispatchPolicy::Fifo, "fail-safe default");
+        assert_eq!(d.fair_aging_secs, 60);
+        assert!(d.fair_weights.is_empty());
+    }
+
+    #[test]
+    fn dispatch_policy_labels_match_serde_names() {
+        assert_eq!(DispatchPolicy::Fifo.as_str(), "fifo");
+        assert_eq!(DispatchPolicy::Edf.as_str(), "edf");
+        assert_eq!(DispatchPolicy::Fair.as_str(), "fair");
+        let round: DispatchPolicy = serde_json::from_str(r#""fair""#).unwrap();
+        assert_eq!(round, DispatchPolicy::Fair);
+        assert!(serde_json::from_str::<DispatchPolicy>(r#""lifo""#).is_err());
+    }
+
+    #[test]
+    fn dispatch_validation_bounds_aging_and_weights() {
+        let mut sc = claimed();
+        sc.dispatch.fair_aging_secs = 0;
+        assert_eq!(validate(&sc).unwrap_err(), "fair_aging_secs must be >= 1");
+        sc.dispatch.fair_aging_secs = 60;
+        sc.dispatch.fair_weights.insert("opencode".into(), 1001);
+        assert_eq!(
+            validate(&sc).unwrap_err(),
+            "fair weight for \"opencode\" must be 1-1000"
+        );
+        sc.dispatch.fair_weights.insert("opencode".into(), 2);
+        sc.dispatch.fair_weights.insert("bad name".into(), 1);
+        assert!(
+            validate(&sc).unwrap_err().contains("fair weight client"),
+            "weight keys share the label charset"
+        );
+        sc.dispatch.fair_weights.clear();
+        validate(&sc).unwrap();
     }
 
     #[test]
@@ -808,6 +997,10 @@ mod tests {
                 Box::new(|sc| sc.limits.heartbeat_secs = 900),
             ),
             ("zero inflight", Box::new(|sc| sc.limits.max_inflight = 0)),
+            (
+                "zero backpressure threshold",
+                Box::new(|sc| sc.limits.backpressure_queue_threshold_eta_secs = 0),
+            ),
             (
                 "bad base_url",
                 Box::new(|sc| sc.upstream.base_url = "ftp://x".into()),

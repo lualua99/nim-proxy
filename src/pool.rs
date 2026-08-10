@@ -114,6 +114,17 @@ impl Calibration {
         }
     }
 
+    /// Restore a persisted factor, clamped to the legal operating range (a
+    /// resumed lane never starts sharper than its lockout floor).
+    fn from_factor(factor: f64) -> Self {
+        Self {
+            factor: factor.clamp(CAL_LOCKOUT_FLOOR, 1.0),
+            locked: false,
+            last_event: None,
+            consecutive_locks: 0,
+        }
+    }
+
     /// Apply an observed upstream rejection to the calibration S-shaped.
     /// `locked` escalates after the lockout signature (2+ rate-limits with
     /// Retry-After >= 30s): such lanes are in exponential backoff upstream,
@@ -122,7 +133,9 @@ impl Calibration {
         self.last_event = Some(now);
         match signal {
             Signal::RateLimited { retry_after } => {
-                let lockout = retry_after.map(|s| s >= LOCKOUT_RETRY_AFTER).unwrap_or(false);
+                let lockout = retry_after
+                    .map(|s| s >= LOCKOUT_RETRY_AFTER)
+                    .unwrap_or(false);
                 self.consecutive_locks = if lockout {
                     self.consecutive_locks + 1
                 } else {
@@ -142,7 +155,11 @@ impl Calibration {
                 self.factor *= CAL_DECAY;
             }
         }
-        self.factor = self.factor.max(if self.locked { CAL_LOCKOUT_FLOOR } else { CAL_FLOOR });
+        self.factor = self.factor.max(if self.locked {
+            CAL_LOCKOUT_FLOOR
+        } else {
+            CAL_FLOOR
+        });
     }
 
     /// Heal toward 1.0, at most one `PROBE_STEP` per PROBE_INTERVAL of
@@ -197,11 +214,30 @@ struct Lane {
     calibration: Mutex<Calibration>,
 }
 
+/// One lane's restorable rate state (in-window sends, bench deadline,
+/// calibration memory) — the shape the persistence layer writes and
+/// [`Pool::restore`] rebuilds from.
+pub struct LaneState {
+    pub key: String,
+    pub rpm: usize,
+    /// Sends still inside the rolling window at snapshot time (pruned).
+    pub sent: VecDeque<Instant>,
+    pub cooldown_until: Instant,
+    /// Calibration factor memory (0.0..=1.0 share of `rpm`).
+    pub factor: f64,
+}
+
 pub struct Pool {
     /// Enabled lanes first (indexes 0..active — the only ones ever granted,
     /// counted, or reported), disabled state carriers after.
     lanes: Vec<Lane>,
     active: usize,
+    /// Recovery slow-start: until this instant the admissible budget is
+    /// `rpm * ramp_factor` instead of the calibration-learned one. Armed at
+    /// boot when fresh rate state was restored; carried across rebuilds so a
+    /// settings change mid-ramp can't end it early.
+    ramp_until: Instant,
+    ramp_factor: f64,
 }
 
 /// One lane's live state (see [`Pool::lane_stats`]).
@@ -244,6 +280,54 @@ impl Pool {
         Self::assemble(specs, Some(self))
     }
 
+    /// Build a pool from persisted rate state ([`Pool::lane_states`] on the
+    /// previous run), matched by key — the same carry-over contract as
+    /// [`Pool::rebuild`], sourced from disk instead of a live pool. Keys
+    /// without persisted state start fresh. `ramp_until`/`ramp_factor` arm
+    /// the recovery slow-start; pass `Instant::now()`, `1.0` to leave it off.
+    pub fn restore(
+        specs: Vec<LaneSpec>,
+        states: &[LaneState],
+        ramp_until: Instant,
+        ramp_factor: f64,
+    ) -> Self {
+        let mut specs = specs;
+        specs.sort_by_key(|s| !s.enabled);
+        let active = specs.iter().filter(|s| s.enabled).count();
+        let now = Instant::now();
+        let lanes = specs
+            .into_iter()
+            .map(|s| match states.iter().find(|st| st.key == s.key) {
+                Some(st) => Lane {
+                    sent: Mutex::new(st.sent.clone()),
+                    cooldown_until: Mutex::new(st.cooldown_until),
+                    calibration: Mutex::new(Calibration::from_factor(st.factor)),
+                    key: s.key,
+                    rpm: s.rpm,
+                },
+                None => Lane {
+                    key: s.key,
+                    rpm: s.rpm,
+                    sent: Mutex::new(VecDeque::new()),
+                    cooldown_until: Mutex::new(now),
+                    calibration: Mutex::new(Calibration::new()),
+                },
+            })
+            .collect();
+        Self {
+            lanes,
+            active,
+            ramp_until,
+            ramp_factor,
+        }
+    }
+
+    /// The slow-start budget: `rpm * ramp_factor`, never 0 (a dead lane
+    /// would hang the dispatcher's window math).
+    fn ramp_budget(&self, lane: &Lane) -> usize {
+        (lane.rpm as f64 * self.ramp_factor).floor().max(1.0) as usize
+    }
+
     fn assemble(mut specs: Vec<LaneSpec>, old: Option<&Pool>) -> Self {
         // Enabled lanes first (stable — preserves relative order), carriers
         // after, so index-based semantics only ever see enabled lanes.
@@ -271,7 +355,18 @@ impl Pool {
                 },
             )
             .collect();
-        Self { lanes, active }
+        // The ramp horizon belongs to the pool generation: armed by a
+        // restore, inherited by every rebuild of that generation.
+        let (ramp_until, ramp_factor) = match old {
+            Some(o) => (o.ramp_until, o.ramp_factor),
+            None => (now, 1.0),
+        };
+        Self {
+            lanes,
+            active,
+            ramp_until,
+            ramp_factor,
+        }
     }
 
     /// Enabled lanes only — carriers are invisible everywhere.
@@ -324,9 +419,11 @@ impl Pool {
         if *lane.cooldown_until.lock().unwrap() > now {
             return None;
         }
-        let cal = lane.calibration.lock().unwrap();
-        let effective = cal.effective_rpm(lane.rpm);
-        drop(cal);
+        let effective = if now < self.ramp_until {
+            self.ramp_budget(lane)
+        } else {
+            lane.calibration.lock().unwrap().effective_rpm(lane.rpm)
+        };
         let mut sent = lane.sent.lock().unwrap();
         while sent.front().is_some_and(|t| now - *t >= WINDOW) {
             sent.pop_front();
@@ -357,9 +454,8 @@ impl Pool {
         let now = Instant::now();
         if let Some(p) = prefer.filter(|&p| p < self.active) {
             if self.lanes[p].calibration.lock().unwrap().maybe_probe(now) {
-                gauge!("nimproxy_lane_calibration", "lane" => p.to_string()).set(
-                    self.lanes[p].calibration.lock().unwrap().factor,
-                );
+                gauge!("nimproxy_lane_calibration", "lane" => p.to_string())
+                    .set(self.lanes[p].calibration.lock().unwrap().factor);
             }
             if let Some(r) = self.try_take(p, now, true) {
                 return r;
@@ -374,10 +470,13 @@ impl Pool {
                 let mut cal = lane.calibration.lock().unwrap();
                 let probed = cal.maybe_probe(now);
                 if probed {
-                    gauge!("nimproxy_lane_calibration", "lane" => i.to_string())
-                        .set(cal.factor);
+                    gauge!("nimproxy_lane_calibration", "lane" => i.to_string()).set(cal.factor);
                 }
-                cal.effective_rpm(lane.rpm)
+                if now < self.ramp_until {
+                    self.ramp_budget(lane)
+                } else {
+                    cal.effective_rpm(lane.rpm)
+                }
             };
             let mut sent = lane.sent.lock().unwrap();
             while sent.front().is_some_and(|t| now - *t >= WINDOW) {
@@ -407,6 +506,59 @@ impl Pool {
             }
         }
         Reservation::Wait(best_wait)
+    }
+
+    /// Minimum wait until some lane can accept a request, without reserving.
+    /// Pure read — no side effects. Returns `Duration::ZERO` if a slot is
+    /// available right now, or the soonest a slot frees up across all lanes.
+    /// Used by the backpressure ETA gate.
+    pub fn min_wait(&self, prefer: Option<usize>) -> Duration {
+        let now = Instant::now();
+        let mut best = WINDOW;
+
+        if let Some(p) = prefer.filter(|&p| p < self.active) {
+            let lane = &self.lanes[p];
+            let cooldown = *lane.cooldown_until.lock().unwrap();
+            if cooldown > now {
+                best = best.min(cooldown - now);
+            }
+            let effective = if now < self.ramp_until {
+                self.ramp_budget(lane)
+            } else {
+                lane.calibration.lock().unwrap().effective_rpm(lane.rpm)
+            };
+            let sent = lane.sent.lock().unwrap();
+            if sent.len() >= effective && effective > 0 {
+                let window_ready = sent[sent.len() - effective] + WINDOW;
+                if window_ready > now {
+                    best = best.min(window_ready - now);
+                }
+            }
+        }
+
+        for lane in self.lanes[..self.active].iter() {
+            let cooldown = *lane.cooldown_until.lock().unwrap();
+            let effective = if now < self.ramp_until {
+                self.ramp_budget(lane)
+            } else {
+                lane.calibration.lock().unwrap().effective_rpm(lane.rpm)
+            };
+            let sent = lane.sent.lock().unwrap();
+            let window_ready = if sent.len() < effective {
+                now
+            } else if effective == 0 {
+                now + WINDOW
+            } else {
+                sent[sent.len() - effective] + WINDOW
+            };
+            let ready_at = window_ready.max(cooldown);
+            if ready_at <= now {
+                return Duration::ZERO;
+            }
+            best = best.min(ready_at - now);
+        }
+
+        best
     }
 
     /// Return a reserved slot that was never spent on an upstream request
@@ -446,6 +598,28 @@ impl Pool {
         self.lanes[..self.active]
             .iter()
             .map(|l| l.calibration.lock().unwrap().factor)
+            .collect()
+    }
+
+    /// All lanes (enabled + carriers), windows pruned to the rolling
+    /// horizon — the shape the persistence layer writes.
+    pub fn lane_states(&self) -> Vec<LaneState> {
+        let now = Instant::now();
+        self.lanes
+            .iter()
+            .map(|l| {
+                let mut sent = l.sent.lock().unwrap();
+                while sent.front().is_some_and(|t| now - *t >= WINDOW) {
+                    sent.pop_front();
+                }
+                LaneState {
+                    key: l.key.clone(),
+                    rpm: l.rpm,
+                    sent: sent.clone(),
+                    cooldown_until: *l.cooldown_until.lock().unwrap(),
+                    factor: l.calibration.lock().unwrap().factor,
+                }
+            })
             .collect()
     }
 }
@@ -665,7 +839,12 @@ mod tests {
     fn observe_rate_limit_shrinks_admission() {
         // rpm=10, one 429 with Retry-After=5: the lane admits ~9/min now.
         let pool = Pool::new(keys(1, 10));
-        pool.observe(0, Signal::RateLimited { retry_after: Some(5) });
+        pool.observe(
+            0,
+            Signal::RateLimited {
+                retry_after: Some(5),
+            },
+        );
         let mut granted = 0;
         while let Reservation::Ready { .. } = pool.reserve(None) {
             granted += 1;
@@ -681,10 +860,18 @@ mod tests {
         // minimal budget (never dead-locked).
         let pool = Pool::new(keys(1, 10));
         for _ in 0..4 {
-            pool.observe(0, Signal::RateLimited { retry_after: Some(30) });
+            pool.observe(
+                0,
+                Signal::RateLimited {
+                    retry_after: Some(30),
+                },
+            );
         }
         let eff = pool.lane_stats()[0].cal_factor;
-        assert!(eff < CAL_FLOOR, "locked lane should sit under the floor: {eff}");
+        assert!(
+            eff < CAL_FLOOR,
+            "locked lane should sit under the floor: {eff}"
+        );
         assert!(eff >= CAL_LOCKOUT_FLOOR);
         // Effective must keep a minimal budget, not zero: one grant stays.
         assert!(matches!(pool.reserve(None), Reservation::Ready { .. }));
@@ -696,7 +883,7 @@ mod tests {
         let pool = Pool::new(keys(1, 10));
         pool.observe(0, Signal::ServerError);
         let eff = pool.lane_stats()[0].cal_factor;
-        assert!(eff < 1.0 && eff >= 0.2);
+        assert!((0.2..1.0).contains(&eff));
         assert_eq!((10.0 * eff).floor().max(1.0) as usize, 9);
         // No lockout flag, so on the 1-min scale a single 503 costs ~10%.
         assert_eq!((10.0 * eff).floor() as usize, 9);
@@ -707,9 +894,106 @@ mod tests {
         // A key that misbehaved keeps its shrunken factor across a rebuild
         // (yes — the same one that carries the window and cooldown).
         let pool = Pool::new(keys(1, 10));
-        pool.observe(0, Signal::RateLimited { retry_after: Some(5) });
+        pool.observe(
+            0,
+            Signal::RateLimited {
+                retry_after: Some(5),
+            },
+        );
         let before = pool.lane_stats()[0].cal_factor;
         let rebuilt = pool.rebuild(keys(1, 10));
         assert!((rebuilt.lane_stats()[0].cal_factor - before).abs() < 1e-9);
+    }
+
+    #[test]
+    fn restore_carries_window_state_and_factor() {
+        let pool = Pool::new(keys(1, 1));
+        take(&pool, None);
+        pool.observe(
+            0,
+            Signal::RateLimited {
+                retry_after: Some(5),
+            },
+        );
+        let states = pool.lane_states();
+        assert_eq!(states[0].sent.len(), 1, "spent slot survives the snapshot");
+        assert!(states[0].factor < 1.0);
+        let restored = Pool::restore(keys(1, 1), &states, Instant::now(), 1.0);
+        assert!(
+            matches!(restored.reserve(None), Reservation::Wait(_)),
+            "a restored spend still counts against the window"
+        );
+        let stats = restored.lane_stats();
+        assert!((stats[0].cal_factor - pool.lane_stats()[0].cal_factor).abs() < 1e-9);
+    }
+
+    #[test]
+    fn restore_keeps_a_persisted_bench() {
+        let states = vec![LaneState {
+            key: "k".into(),
+            rpm: 10,
+            sent: VecDeque::new(),
+            cooldown_until: Instant::now() + Duration::from_secs(45),
+            factor: 1.0,
+        }];
+        let pool = Pool::restore(
+            vec![spec("k", 10, true), spec("other", 10, true)],
+            &states,
+            Instant::now(),
+            1.0,
+        );
+        match pool.reserve(Some(0)) {
+            Reservation::Ready { lane, .. } => assert_eq!(lane, 1),
+            _ => panic!("expected the spill lane to take the grant"),
+        }
+    }
+
+    #[test]
+    fn restore_unknown_keys_start_fresh() {
+        let now = Instant::now();
+        let states = vec![LaneState {
+            key: "old".into(),
+            rpm: 1,
+            sent: VecDeque::from([now]),
+            cooldown_until: now + Duration::from_secs(999),
+            factor: 0.5,
+        }];
+        let restored = Pool::restore(vec![spec("new", 1, true)], &states, Instant::now(), 1.0);
+        assert!(matches!(restored.reserve(None), Reservation::Ready { .. }));
+        assert_eq!(restored.lane_stats()[0].cal_factor, 1.0);
+    }
+
+    #[test]
+    fn ramp_slows_admission_only_while_armed() {
+        let ramp = Instant::now() + Duration::from_secs(300);
+        let pool = Pool::restore(keys(1, 10), &[], ramp, 0.5);
+        let mut granted = 0;
+        while let Reservation::Ready { .. } = pool.reserve(None) {
+            granted += 1;
+        }
+        assert_eq!(granted, 5, "slow-start admits rpm * ramp_factor");
+        // Unarmed (no ramp horizon) pools run at full budget.
+        let mut granted = 0;
+        let unarmed = Pool::restore(keys(1, 10), &[], Instant::now(), 0.5);
+        while let Reservation::Ready { .. } = unarmed.reserve(None) {
+            granted += 1;
+        }
+        assert_eq!(granted, 10);
+    }
+
+    #[test]
+    fn rebuild_carries_the_ramp_window() {
+        let pool = Pool::restore(
+            keys(1, 10),
+            &[],
+            Instant::now() + Duration::from_secs(120),
+            0.3,
+        );
+        let rebuilt = pool.rebuild(keys(1, 10));
+        let mut granted = 0;
+        while let Reservation::Ready { .. } = rebuilt.reserve(None) {
+            granted += 1;
+        }
+        assert_eq!(granted, 3, "a settings swap must not sever the slow-start");
     }
 }
