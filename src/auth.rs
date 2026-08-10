@@ -577,37 +577,127 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// The dashboard's 68×68 PNG mark, inlined as base64 so the login card shares
+/// the exact same brand logo as the sidebar without an extra request.
+const LOGO_PNG_B64: &str =
+    "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";
+
 fn login_html(error: bool) -> Response {
     let err = if error {
-        r#"<p class="err">Incorrect username or password.</p>"#
+        r#"<p class="acct-err">Incorrect username or password.</p>"#
     } else {
         ""
     };
     let html = format!(
         r##"<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>NIM Proxy — Sign in</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script>
+(function () {{
+  var t = null;
+  try {{ t = localStorage.getItem('np-theme'); }} catch (e) {{}}
+  var dark = t ? t === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
+  document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+}})();
+</script>
 <style>
-:root {{ color-scheme: light dark; }}
-body {{ margin:0; min-height:100vh; display:grid; place-items:center;
-  font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; background:#f9f9f7; color:#0b0b0b; }}
-@media (prefers-color-scheme:dark) {{ body {{ background:#0d0d0d; color:#fff; }} }}
-.card {{ background:Canvas; border:1px solid rgba(128,128,128,.25); border-radius:14px;
-  padding:28px 26px; width:300px; box-shadow:0 6px 24px rgba(0,0,0,.12); }}
-h1 {{ font-size:17px; margin:0 0 4px; }}
-p.sub {{ color:#898781; font-size:13px; margin:0 0 18px; }}
-input {{ width:100%; box-sizing:border-box; font:inherit; padding:9px 11px; border-radius:9px;
-  border:1px solid rgba(128,128,128,.4); background:Field; color:inherit; margin-bottom:12px; }}
-button {{ width:100%; font:inherit; font-weight:600; padding:9px; border:0; border-radius:9px;
-  background:#2a78d6; color:#fff; cursor:pointer; }}
-.err {{ color:#d03b3b; font-size:13px; margin:0 0 12px; }}
+:root {{
+  --bg: #f8f9fb; --card: #ffffff; --card-border: #E5E7EC;
+  --ink-1: #111827; --ink-2: #374151; --ink-25: #6B7280; --ink-3: #99A2AF;
+  --brand: #6366F1; --brand-lt: #4F46E5; --brand-ring: #C7D2FE;
+  --ring-soft: rgba(99,102,241,0.13); --chip-bad: rgba(239,68,68,0.1); --red-dk: #DC2626;
+  --shadow-card: 0 1px 2px rgba(16,24,40,0.04), 0 1px 3px rgba(16,24,40,0.06);
+  --glow-top: rgba(99,102,241,0.08);
+  --mono: 'Inter', system-ui, -apple-system, sans-serif;
+}}
+:root[data-theme="dark"] {{
+  --bg: #111625; --card: #1A2135; --card-border: rgba(255,255,255,0.09);
+  --ink-1: #F2F4F8; --ink-2: #CDD5E0; --ink-25: #96A0B4; --ink-3: #6B7688;
+  --brand: #818CF8; --brand-lt: #A5B4FC; --brand-ring: #6366F1;
+  --ring-soft: rgba(129,140,248,0.2); --chip-bad: rgba(248,113,113,0.16); --red-dk: #FCA5A5;
+  --shadow-card: 0 1px 2px rgba(0,0,0,0.25);
+  --glow-top: rgba(99,102,241,0.1);
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px;
+  font: 14px/1.45 'Inter', system-ui, sans-serif; color: var(--ink-1);
+  background: radial-gradient(1100px 400px at 82% -14%, var(--glow-top), transparent 66%), var(--bg);
+}}
+.theme-toggle {{
+  position: fixed; top: 18px; right: 18px; width: 30px; height: 30px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--card-border); border-radius: 9px; background: var(--card);
+  color: var(--ink-25); box-shadow: var(--shadow-card); cursor: pointer;
+}}
+.theme-toggle:hover {{ color: var(--ink-1); border-color: var(--brand-ring); }}
+.theme-toggle svg {{ flex: none; }}
+.theme-toggle .sun {{ display: none; }}
+:root[data-theme="dark"] .theme-toggle .sun {{ display: block; }}
+:root[data-theme="dark"] .theme-toggle .moon {{ display: none; }}
+.card {{
+  width: 400px; max-width: 92%; background: var(--card); border: 1px solid var(--card-border);
+  border-radius: 14px; padding: 30px 28px; box-shadow: var(--shadow-card);
+  animation: fadeIn .3s ease;
+}}
+@keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(6px); }} to {{ opacity: 1; transform: none; }} }}
+.brand {{ display: flex; align-items: center; gap: 11px; margin: 0 0 6px; }}
+.brand img {{ flex: none; display: block; border-radius: 10px; box-shadow: var(--shadow-card); }}
+.wordmark {{ font-size: 19px; font-weight: 700; letter-spacing: -0.2px; line-height: 1; }}
+.wordmark b {{ color: var(--brand-lt); font-weight: 700; }}
+p.sub {{ color: var(--ink-3); font-size: 13px; margin: 0 0 20px; }}
+.field {{ position: relative; margin-bottom: 14px; }}
+.field svg {{ position: absolute; left: 11px; top: 50%; transform: translateY(-50%); stroke: var(--ink-3); }}
+.field input {{
+  width: 100%; font: 500 13px var(--mono); color: var(--ink-1); background: var(--card);
+  border: 1px solid var(--card-border); border-radius: 8px; padding: 10px 12px 10px 34px;
+  box-shadow: var(--shadow-card); transition: border-color .15s, box-shadow .15s;
+}}
+.field input:focus {{ outline: none; border-color: var(--brand-ring); box-shadow: 0 0 0 3px var(--ring-soft); }}
+.acct-err {{ font: 600 11px var(--mono); color: var(--red-dk); background: var(--chip-bad);
+  border-radius: 99px; padding: 4px 10px; margin: 0 0 16px; }}
+button[type="submit"] {{
+  width: 100%; font: 600 13px var(--mono); color: #fff; background: var(--brand);
+  border: 0; border-radius: 99px; padding: 10px; cursor: pointer;
+  transition: background .15s;
+}}
+button[type="submit"]:hover {{ background: var(--brand-lt); }}
+@media (max-width: 480px) {{ .card {{ padding: 24px 20px; }} }}
 </style></head><body>
+<button class="theme-toggle" id="theme-toggle" title="Toggle dark / light theme" aria-label="Toggle theme">
+  <svg class="moon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke-width="1.5"><path d="M13.5 9.5A6 6 0 0 1 6.5 2.5a6 6 0 1 0 7 7z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  <svg class="sun" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke-width="1.5"><circle cx="8" cy="8" r="3.2"/><path d="M8 1v2M8 13v2M1.5 8h2M12.5 8h2M3 3l1.4 1.4M11.6 11.6L13 13M13 3l-1.4 1.4M4.4 11.6L3 13" stroke-linecap="round"/></svg>
+</button>
 <form class="card" method="post" action="/login">
-  <h1>NIM&nbsp;Proxy</h1><p class="sub">Sign in to the dashboard.</p>
+  <div class="brand">
+    <img src="data:image/png;base64,{LOGO_PNG_B64}" width="40" height="40" alt="">
+    <span class="wordmark"><b>NIM</b> Proxy</span>
+  </div>
+  <p class="sub">Sign in to the dashboard.</p>
   {err}
-  <input type="text" name="username" placeholder="Username" autofocus autocomplete="username">
-  <input type="password" name="password" placeholder="Password" autocomplete="current-password">
+  <div class="field">
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM2.5 14c.6-2.4 2-3.5 5.5-3.5s4.9 1.1 5.5 3.5"/></svg>
+    <input type="text" name="username" placeholder="Username" autofocus autocomplete="username">
+  </div>
+  <div class="field">
+    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>
+    <input type="password" name="password" placeholder="Password" autocomplete="current-password">
+  </div>
   <button type="submit">Sign in</button>
-</form></body></html>"##
+</form>
+<script>
+(function () {{
+  document.getElementById('theme-toggle').addEventListener('click', function () {{
+    var root = document.documentElement;
+    var next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+    try {{ localStorage.setItem('np-theme', next); }} catch (e) {{}}
+  }});
+}})();
+</script>
+</body></html>"##
     );
     let status = if error {
         StatusCode::UNAUTHORIZED
