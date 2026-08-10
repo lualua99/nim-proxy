@@ -1,7 +1,8 @@
 # 任务 06：平滑重启：限流状态持久化 + 预热恢复（Restart-smooth recovery）
 
-> 状态：提案（未开始）
+> 状态：已完成
 > 日期：2026-08-09
+> 完成日期：2026-08-10
 > 需求：README 已明示的局限——"Rate windows reset on restart"：进程重启后
 > 内存窗口清零，代理以为每把 key 都是空窗口，立刻又打满 40 RPM，而上游
 > 还记着刚用过的次数 → 重启后必吃一串 429（靠 retry 静默吸收，用户只感到
@@ -97,3 +98,26 @@
   叠加语义（ramp 结束 → calibration 接管）需在决策页写清。
 
 ---
+
+## 实施记录
+
+### 2026-08-10 — 全部完成
+
+**核心代码**：
+- `src/ratestate.rs`（新模块，~510 行，含 11 个单测）：versioned JSONL 原子写、损坏降级、epoch 截断（保守方向：少记）、cooldown future 修正、`RAMP_STALE_CUTOFF` 5min 新鲜度门。
+- `src/pool.rs`：`LaneState` 快照 + `Pool::restore` + ramp 慢启动（`rpm×ramp_factor`，arm 期内有效，结束后 calibration 接管退出），5 个新单测。
+- `src/governor.rs`：non-zero caps 快照/恢复，1 个新单测。
+- `src/config.rs`/`src/settings.rs`：`RecoveryCfg{ramp_secs, ramp_factor}` 配置项、Settings 编辑、验证。
+- `src/lib.rs`：启动恢复装配、saver 任务（1s 循环，30s 定时 + `ratestate_dirty` 即刻触发）、clean-shutdown final save（SIGTERM/docker stop 落盘精确窗口）、`NIMPROXY_RAMP_SECS/FACTOR` 环境覆写、`nimproxy_ramp_active` gauge、`api_dashboard_now` 暴露 ramp 字段。
+- `src/dashboard.html`：Settings「Restart recovery」卡片、Capacity hero「recovering」徽章。
+
+**测试**：158 个 lib 单测 + 100 个 e2e 全量通过。新加 e2e 测试：
+- `rate_windows_survive_a_restart`：打满 2-slot 窗口 → 重启 → 断言 504（非 200），证明窗口跨重启保留。
+- `ramp_slows_traffic_after_a_quick_restart`：重启后 ramp 25% → 8 请求并发，正好 2 成功 6 504，证明 ramp 生效。
+
+**文档**：
+- 决策页 `knowledge/decisions/persist-rate-windows-across-restart.md`（ADR 格式：epoch 保守性、ramp 新鲜门、calibration 交接、clean-shutdown save）。
+- `knowledge/index.md` 新增行、`knowledge/log.md` 新增条。
+- CHANGELOG [Unreleased] Added 条目、README FAQ 替换原"Rate windows reset on restart"。
+
+**验证门**：`cargo fmt --check` 干净、`cargo clippy --all-targets -- -D warnings` 干净、`cargo test` 258 个测试全通过。

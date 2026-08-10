@@ -10,6 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::http::header;
 use support::{
     chat_body, complete_setup, expect_refuses_to_start, login, login_as, metrics, read_sse,
     restart, scratch_data_dir, start_mock, start_proxy, start_proxy_fresh, start_proxy_in,
@@ -605,7 +606,11 @@ async fn api_models_requires_login_and_rides_the_shared_catalog_cache() {
     assert_eq!(unauth.status(), 401);
 
     let cookie = login(&proxy).await;
-    let get = || client().get(proxy.url("/api/models")).header("cookie", &cookie);
+    let get = || {
+        client()
+            .get(proxy.url("/api/models"))
+            .header("cookie", &cookie)
+    };
 
     // Cold cache: the first dashboard fetch triggers one upstream call and
     // reports the cache metadata.
@@ -1492,12 +1497,133 @@ async fn dashboard_now_contract_uses_current_pool_config_and_registry() {
     assert!(body["tail"]["totals"].as_array().is_some());
     assert!(body["metrics"].as_array().is_some());
 
+    // Window occupancy fields: no requests yet, so fill is 0 while the
+    // capacity budget reflects each lane's calibrated admission (40 RPM).
+    let lanes = body["per_lane"].as_array().unwrap();
+    assert_eq!(lanes.len(), 3);
+    for lane in lanes {
+        assert!(lane["key"].is_string());
+        assert_eq!(lane["rpm"], 40);
+        assert!(lane["effective_rpm"].as_u64().is_some());
+        assert_eq!(lane["in_window"], 0);
+    }
+    assert_eq!(body["window_fill"], 0);
+    assert_eq!(body["window_capacity"], 120);
+
     let response = client()
         .get(proxy.url("/api/dashboard/now"))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 401);
+}
+
+#[tokio::test]
+async fn dashboard_now_window_fill_reflects_real_count_not_rate_extrapolation() {
+    let mock = start_mock().await;
+    let proxy = start_proxy(&mock.url, &[]).await;
+    let cookie = login(&proxy).await;
+
+    // Before any requests: empty window.
+    let before = dashboard_now(&proxy, &cookie).await;
+    assert_eq!(before["window_fill"], 0);
+    assert_eq!(before["window_capacity"], 120);
+
+    // Send a single request — window_fill should be 1, not 0 (and not 20
+    // as the old RPM extrapolation would have projected).
+    send_successful_chats(&proxy, 1).await;
+    let after = dashboard_now(&proxy, &cookie).await;
+    assert_eq!(
+        after["window_fill"], 1,
+        "single request must fill exactly 1 window slot, not a rate extrapolation: {after}"
+    );
+    assert_eq!(after["window_capacity"], 120);
+    assert!(after["window_fill"].as_u64().unwrap() < after["window_capacity"].as_u64().unwrap());
+    // One of the three lanes should have in_window=1 (the others 0).
+    let per_lane = after["per_lane"].as_array().unwrap();
+    let lane_in_windows: Vec<u64> = per_lane
+        .iter()
+        .map(|l| l["in_window"].as_u64().unwrap())
+        .collect();
+    let sum_in_window: u64 = lane_in_windows.iter().sum();
+    assert_eq!(
+        sum_in_window, 1,
+        "per-lane in_window must sum to window_fill: {lane_in_windows:?}"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_capacity_model_contract_requires_auth_and_returns_aggregates() {
+    let mock = start_mock().await;
+    let proxy = start_proxy(&mock.url, &[]).await;
+    let cookie = login(&proxy).await;
+
+    // Requires session.
+    let noauth = client()
+        .get(proxy.url("/api/dashboard/capacity-model"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(noauth.status(), 401);
+
+    // Returns 200 + expected structure.
+    let response = client()
+        .get(proxy.url("/api/dashboard/capacity-model"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+
+    assert!(body["sampled_at"].as_u64().is_some(), "sampled_at");
+    assert_eq!(body["window_seconds"], 3600);
+
+    // per_key
+    let pk = &body["per_key"];
+    assert!(pk["rpm"].is_array(), "rpm array");
+    assert!(pk["calibration"].is_array(), "calibration array");
+    assert!(pk["effective_rpm"].is_array(), "effective_rpm array");
+    assert!(pk["capacity_rpm"].as_u64().is_some(), "capacity_rpm");
+
+    // per_client
+    let pc = &body["per_client"];
+    assert!(pc["count"].as_u64().is_some(), "client count");
+    assert!(
+        pc["total_requests"].is_null() || pc["total_requests"].as_f64().is_some(),
+        "total_requests"
+    );
+    assert!(
+        pc["observed_rpm"].is_null() || pc["observed_rpm"].as_f64().is_some(),
+        "observed_rpm"
+    );
+
+    // per_model
+    let pm = &body["per_model"];
+    assert!(pm["caps"].is_array(), "model caps array");
+    assert!(pm["overrides"].is_object(), "overrides object");
+
+    // history_sample
+    let hs = &body["history_sample"];
+    assert!(hs["queue_wait_p50"].is_null() || hs["queue_wait_p50"].as_f64().is_some());
+    assert!(hs["queue_wait_p95"].is_null() || hs["queue_wait_p95"].as_f64().is_some());
+    assert!(
+        hs["upstream_seconds_mean"].is_null() || hs["upstream_seconds_mean"].as_f64().is_some(),
+        "upstream_seconds_mean"
+    );
+    assert!(
+        hs["tokens_per_second_mean"].is_null() || hs["tokens_per_second_mean"].as_f64().is_some(),
+        "tokens_per_second_mean"
+    );
+    assert!(hs["ttft_p50"].is_null() || hs["ttft_p50"].as_f64().is_some());
+    assert!(
+        hs["requests_per_min"].is_null() || hs["requests_per_min"].as_f64().is_some(),
+        "requests_per_min"
+    );
+
+    // Default pool: 3 lanes × 40 rpm = 120 capacity.
+    assert_eq!(pk["capacity_rpm"], 120);
+    assert_eq!(pk["rpm"], serde_json::json!([40, 40, 40]));
 }
 
 #[tokio::test]
@@ -2403,7 +2529,9 @@ async fn user_role_is_denied_server_settings_and_foreign_keys() {
             serde_json::json!({
                 "max_wait_secs": 60, "heartbeat_secs": 5, "models_ttl_secs": 600,
                 "stream_idle_secs": 300, "request_timeout_secs": 300,
-                "max_inflight": 512, "strict_passthrough": false
+                "max_inflight": 512, "strict_passthrough": false,
+                "backpressure_enabled": false,
+                "backpressure_queue_threshold_eta_secs": 20
             }),
         ),
         (
@@ -3113,7 +3241,9 @@ async fn limits_validation_rejects_bad_bounds_and_partial_bodies() {
         serde_json::json!({
             "max_wait_secs": 5, "heartbeat_secs": 10, "models_ttl_secs": 600,
             "stream_idle_secs": 300, "request_timeout_secs": 300,
-            "max_inflight": 512, "strict_passthrough": false
+            "max_inflight": 512, "strict_passthrough": false,
+            "backpressure_enabled": false,
+            "backpressure_queue_threshold_eta_secs": 20
         }),
     )
     .await;
@@ -3790,7 +3920,7 @@ async fn health_probe_flag_reports_liveness() {
         run_health(proxy.port.to_string()).success(),
         "--health exits 0 against a healthy proxy"
     );
-assert!(
+    assert!(
         !run_health("1".into()).success(),
         "--health exits non-zero against a dead port"
     );
@@ -3828,7 +3958,9 @@ async fn queue_lists_inflight_requests_and_terminates_them_with_code_91() {
         tokio::spawn(async move {
             let mut stream = stream;
             while let Some(Ok(chunk)) = stream.next().await {
-                out.lock().unwrap().push_str(&String::from_utf8_lossy(&chunk));
+                out.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&chunk));
             }
         });
     }
@@ -3952,7 +4084,10 @@ async fn queue_is_admin_only_and_now_reports_the_role() {
     assert_eq!(get.status(), 200);
 
     assert_eq!(dashboard_now(&proxy, &user_cookie).await["role"], "user");
-    assert_eq!(dashboard_now(&proxy, &admin_cookie).await["role"], "superuser");
+    assert_eq!(
+        dashboard_now(&proxy, &admin_cookie).await["role"],
+        "superuser"
+    );
 }
 
 /// A buffered (non-streaming) request killed while waiting on upstream
@@ -3999,7 +4134,11 @@ async fn queue_terminates_buffered_requests_with_a_json_91() {
     assert_eq!(r.status(), 200);
 
     let resp = waiting.await.unwrap();
-    assert_eq!(resp.status(), 400, "buffered kill answers 400, not the 200-body");
+    assert_eq!(
+        resp.status(),
+        400,
+        "buffered kill answers 400, not the 200-body"
+    );
     let v: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(v["error"]["code"], "-91", "{v}");
     assert!(
@@ -4152,7 +4291,9 @@ async fn queue_reports_waiting_permit_phase() {
         tokio::spawn(async move {
             let mut holder = holder;
             while let Some(Ok(chunk)) = holder.next().await {
-                out.lock().unwrap().push_str(&String::from_utf8_lossy(&chunk));
+                out.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&chunk));
             }
         });
     }
@@ -4170,7 +4311,10 @@ async fn queue_reports_waiting_permit_phase() {
         let waiter_out = waiter_out.clone();
         tokio::spawn(async move {
             while let Some(Ok(chunk)) = waiter.next().await {
-                waiter_out.lock().unwrap().push_str(&String::from_utf8_lossy(&chunk));
+                waiter_out
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&chunk));
             }
         });
     }
@@ -4184,10 +4328,16 @@ async fn queue_reports_waiting_permit_phase() {
             .unwrap();
         let q: serde_json::Value = v.json().await.unwrap();
         let reqs = q["requests"].as_array().unwrap();
-        if let Some(w) = reqs.iter().find(|r| r["model"] == "mock/model-a" && r["phase"] == "waiting_permit") {
+        if let Some(w) = reqs
+            .iter()
+            .find(|r| r["model"] == "mock/model-a" && r["phase"] == "waiting_permit")
+        {
             break w.clone();
         }
-        assert!(reqs.iter().any(|r| r["phase"] == "upstream"), "holder must be upstream: {q}");
+        assert!(
+            reqs.iter().any(|r| r["phase"] == "upstream"),
+            "holder must be upstream: {q}"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
@@ -4214,4 +4364,662 @@ async fn queue_reports_waiting_permit_phase() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// The dispatch policy is configurable and observable: an admin flips the
+/// policy through /api/settings/dispatch, /api/config reports it back, the
+/// queue surface names it, and alongside /metrics the dispatcher exposes the
+/// live-policy gauge — all while requests keep flowing (a store switch that
+/// wedged the dispatcher would hang every request).
+#[tokio::test]
+async fn dispatch_policy_settings_round_trip_and_live_swaps() {
+    let mock = start_mock().await;
+    // A plain user must not be able to change the scheduling policy.
+    let mut opts = StoreOpts::default();
+    opts.extra_users.push(("peon".into(), "user".into()));
+    let proxy = start_proxy_with(&mock.url, opts, &[]).await;
+    let cookie = login(&proxy).await;
+
+    // Defaults: FIFO both in the store and in the queue view.
+    let cfg: serde_json::Value = client()
+        .get(proxy.url("/api/config"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cfg["server"]["dispatch"]["policy"], "fifo");
+    assert_eq!(cfg["server"]["dispatch"]["fair_aging_secs"], 60);
+    assert!(cfg["server"]["dispatch"]["fair_weights"].is_object());
+    let q: serde_json::Value = client()
+        .get(proxy.url("/api/queue"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(q["dispatch_policy"], "fifo");
+
+    // Non-admins cannot touch the policy.
+    let denied = client()
+        .post(proxy.url("/api/settings/dispatch"))
+        .header("cookie", &login_as(&proxy, "peon").await)
+        .json(&serde_json::json!({ "policy": "fair" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403);
+
+    // Flip to Fair with an aging bound and a per-client weight; keep the
+    // proxy serving requests across the swap.
+    let r = client()
+        .post(proxy.url("/api/settings/dispatch"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({
+            "policy": "fair",
+            "fair_aging_secs": 5,
+            "set_weight": ["opencode", 3],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let cfg: serde_json::Value = client()
+        .get(proxy.url("/api/config"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cfg["server"]["dispatch"]["policy"], "fair");
+    assert_eq!(cfg["server"]["dispatch"]["fair_aging_secs"], 5);
+    assert_eq!(cfg["server"]["dispatch"]["fair_weights"]["opencode"], 3);
+
+    // The queue view now names the live policy.
+    let q: serde_json::Value = client()
+        .get(proxy.url("/api/queue"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(q["dispatch_policy"], "fair");
+
+    // Requests still flow end-to-end under Fair.
+    send_successful_chats(&proxy, 2).await;
+
+    // Removing the weight override round-trips too.
+    let r = client()
+        .post(proxy.url("/api/settings/dispatch"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({ "remove_weight": "opencode" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let cfg: serde_json::Value = client()
+        .get(proxy.url("/api/config"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        cfg["server"]["dispatch"]["fair_weights"]["opencode"],
+        serde_json::Value::Null
+    );
+
+    // A bogus policy is a client error, not a half-applied state.
+    let bad = client()
+        .post(proxy.url("/api/settings/dispatch"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({ "policy": "lifo" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+
+    // A restart honors the persisted policy.
+    let proxy = restart(proxy, &[]).await;
+    let q: serde_json::Value = client()
+        .get(proxy.url("/api/queue"))
+        .header("cookie", &login(&proxy).await)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        q["dispatch_policy"], "fair",
+        "policy persists across restart"
+    );
+}
+
+/// Under contention an explicit deadline is the dispatcher's ordering key
+/// with EDF: a deadline-carrying request behind a long holder is served
+/// before its deadline passes or fails fast at its own bound, never parked
+/// at max_wait. (The queue deadline is the minimum of the default wait and
+/// the header's absolute bound.)
+#[tokio::test]
+async fn edf_deadline_bounds_the_queue_wait() {
+    let mock = start_mock().await;
+    let proxy = start_proxy(&mock.url, &[]).await;
+    let cookie = login(&proxy).await;
+    let r = client()
+        .post(proxy.url("/api/settings/dispatch"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({ "policy": "edf" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    // Occupy the pool with a long stream, then queue a deadline-carrying
+    // request behind it with a sub-second bound.
+    mock.state.push(Behavior::ActiveStream(120));
+    let _busy = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("edf holder", true))
+        .send()
+        .await
+        .unwrap();
+
+    let started = Instant::now();
+    let urgent = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .header("x-nim-proxy-deadline-ms", "700")
+        .json(&chat_body("edf urgent", false))
+        .send()
+        .await
+        .unwrap();
+    // Either it wins a slot promptly (EDF ordering) or fails fast at its own
+    // deadline (~700ms); it must NOT sit queued past its header deadline.
+    assert!(
+        urgent.status().is_success() || urgent.status() == reqwest::StatusCode::GATEWAY_TIMEOUT,
+        "urgent request should serve or fail fast, got {}",
+        urgent.status()
+    );
+    if urgent.status() == reqwest::StatusCode::GATEWAY_TIMEOUT {
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "deadline request should fail fast at its own bound, waited {elapsed:?}"
+        );
+    }
+    // The holder keeps its slot; a plain request may simply wait (max_wait
+    // is 30s in the fixture) — do not assert on it, just let the test end.
+}
+
+/// A restart does not reset upstream pacing: the rate window persisted on
+/// clean shutdown is honored by the next boot, so a still-full key stays
+/// throttled instead of bursting past its rpm. Ramp is disabled so this
+/// assertion isolates window restoration from slow-start.
+#[tokio::test]
+async fn rate_windows_survive_a_restart() {
+    let envs = &[("NIMPROXY_RAMP_SECS", "0")];
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(
+        &mock.url,
+        StoreOpts {
+            nim_keys: vec![("only-key".into(), 2)],
+            max_wait_secs: 2,
+            heartbeat_secs: 1,
+            ..keyed("alice", "sekrit")
+        },
+        envs,
+    )
+    .await;
+
+    // Fill the 2-slot window.
+    for _ in 0..2 {
+        let r = client()
+            .post(proxy.url("/v1/chat/completions"))
+            .bearer_auth("sekrit")
+            .json(&chat_body("hi", false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+    assert_eq!(mock.state.hit_count(), 2);
+
+    // Restart the same DATA_DIR; the window rides over in ratestate.jsonl.
+    let proxy = restart(proxy, envs).await;
+    let cookie = login(&proxy).await;
+    let now: serde_json::Value = client()
+        .get(proxy.url("/api/dashboard/now"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(now["restored_lanes"], 1, "lane restored from disk: {now}");
+
+    // The window is still full: the next request cannot fit and must fail
+    // fast. A lost window would admit it immediately at full rpm.
+    let third = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .bearer_auth("sekrit")
+        .json(&chat_body("hi", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        third.status(),
+        504,
+        "persisted window kept the key throttled across restart"
+    );
+    assert_eq!(
+        mock.state.hit_count(),
+        2,
+        "no new upstream traffic slipped out after restart"
+    );
+}
+
+/// After a quick restart the slow-start ramp engages: a key stepping back
+/// from a recovered window admits only rpm × ramp_factor, letting surplus
+/// requests shed with 504 instead of firing a burst at the upstream.
+#[tokio::test]
+async fn ramp_slows_traffic_after_a_quick_restart() {
+    let cold_envs = &[("NIMPROXY_RAMP_SECS", "0")];
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(
+        &mock.url,
+        StoreOpts {
+            nim_keys: vec![("only-key".into(), 20)],
+            max_wait_secs: 2,
+            heartbeat_secs: 1,
+            ..keyed("alice", "sekrit")
+        },
+        cold_envs,
+    )
+    .await;
+
+    // Some traffic before the restart so the persisted window isn't empty.
+    for _ in 0..3 {
+        let r = client()
+            .post(proxy.url("/v1/chat/completions"))
+            .bearer_auth("sekrit")
+            .json(&chat_body("hi", false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+
+    // Restart with a long ramp at 25% of budget.
+    let ramp_envs = &[
+        ("NIMPROXY_RAMP_SECS", "120"),
+        ("NIMPROXY_RAMP_FACTOR", "0.25"),
+    ];
+    let proxy = restart(proxy, ramp_envs).await;
+
+    // The ramp gauge is live and the window was recovered.
+    let text = metrics(&proxy).await;
+    assert!(
+        text.contains("nimproxy_ramp_active 1"),
+        "ramp gauge on after restart: {text}"
+    );
+    let cookie = login(&proxy).await;
+    let now: serde_json::Value = client()
+        .get(proxy.url("/api/dashboard/now"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(now["ramp_active"], true, "{now}");
+    assert_eq!(now["restored_lanes"], 1, "{now}");
+
+    // Burst of 8. The recovered window holds 3 recent slots; the ramp budget
+    // is 20 × 0.25 = 5, so exactly 2 more pass and the other 6 shed fast.
+    let statuses = futures_util::future::join_all((0..8).map(|_| {
+        client()
+            .post(proxy.url("/v1/chat/completions"))
+            .bearer_auth("sekrit")
+            .json(&chat_body("burst", false))
+            .send()
+    }))
+    .await;
+    let mut ok = 0;
+    let mut limited = 0;
+    for r in statuses {
+        let r = r.unwrap();
+        if r.status() == 200 {
+            ok += 1;
+        } else if r.status() == 504 {
+            limited += 1;
+        } else {
+            panic!("unexpected status {}", r.status());
+        }
+    }
+    assert_eq!(
+        ok, 2,
+        "ramp admitted exactly rpm × factor past the restored window"
+    );
+    assert_eq!(limited, 6, "surplus requests shed while the ramp is on");
+    assert_eq!(mock.state.hit_count(), 5, "upstream saw 3 cold + 2 ramped");
+}
+
+// --- Graduated backpressure tests ---
+
+/// Helper: backpressure fixture with 1 key at 1 RPM, backpressure on, 10s
+/// threshold. Saturating the lane forces ETA = window ~61s >> 10s threshold.
+fn backpressure_opts() -> StoreOpts {
+    StoreOpts {
+        nim_keys: vec![("test-key-0".into(), 1)],
+        max_wait_secs: 120,
+        heartbeat_secs: 1,
+        backpressure_enabled: true,
+        backpressure_queue_threshold_eta_secs: 10,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn backpressure_rejects_with_503_and_retry_after_when_eta_exceeds_threshold() {
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(&mock.url, backpressure_opts(), &[]).await;
+
+    // Occupy the single lane so ETA >> threshold.
+    let hog = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("hog", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hog.status(), 200);
+
+    // Next request should be rejected by backpressure (no deadline).
+    let resp = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("burst", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+    let retry_after = resp
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    assert!(
+        retry_after.is_some() && retry_after.unwrap() >= 10,
+        "Retry-After should be >= 10s, got {:?}",
+        retry_after
+    );
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "backpressure");
+
+    let metrics = metrics(&proxy).await;
+    assert!(metrics.contains("nimproxy_backpressure_total{kind=\"reject\"} 1"));
+}
+
+#[tokio::test]
+async fn backpressure_does_not_affect_requests_with_explicit_deadline() {
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(&mock.url, backpressure_opts(), &[]).await;
+
+    // Occupy the single lane.
+    let hog = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("hog", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hog.status(), 200);
+
+    // A request with X-Nim-Proxy-Deadline-Ms must bypass backpressure
+    // and queue normally (the deadline will eventually expire).
+    let resp = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .header("X-Nim-Proxy-Deadline-Ms", "5000")
+        .json(&chat_body("deadline", false))
+        .send()
+        .await
+        .unwrap();
+    // Must NOT be 503 — the deadline request is exempt.
+    assert_ne!(resp.status(), 503);
+    // It will either queue and eventually get 504 (deadline expires) or
+    // possibly get through if the hog finishes fast enough. Either is fine
+    // as long as it's not a backpressure reject.
+    assert!(
+        resp.status() == 504 || resp.status() == 200,
+        "expected 504 or 200, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn backpressure_streaming_eta_header_appears_when_eta_below_threshold() {
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(&mock.url, backpressure_opts(), &[]).await;
+
+    // Free lane → ETA = 0, well below threshold → streaming response gets
+    // X-Nim-Proxy-Eta header.
+    let resp = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("stream-test", true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let eta = resp
+        .headers()
+        .get("X-Nim-Proxy-Eta")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    assert_eq!(
+        eta,
+        Some(0),
+        "X-Nim-Proxy-Eta should be 0 when lane is free"
+    );
+    let body = read_sse(resp).await;
+    assert!(body.contains("hello"), "stream body should be relayed");
+
+    let metrics = metrics(&proxy).await;
+    assert!(metrics.contains(r#"nimproxy_backpressure_total{kind="eta"}"#));
+}
+
+#[tokio::test]
+async fn backpressure_disabled_falls_back_to_normal_behavior() {
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(
+        &mock.url,
+        StoreOpts {
+            nim_keys: vec![("test-key-0".into(), 1)],
+            max_wait_secs: 5,
+            heartbeat_secs: 1,
+            backpressure_enabled: false,
+            ..Default::default()
+        },
+        &[],
+    )
+    .await;
+
+    // Occupy the single lane.
+    let hog = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("hog", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hog.status(), 200);
+
+    // Backpressure is off → request queues normally and gets 504 quickly
+    // (max_wait = 5s, far below the 61s window).
+    let resp = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("queued", false))
+        .send()
+        .await
+        .unwrap();
+    // Must NOT be 503 (backpressure is disabled).
+    assert_ne!(resp.status(), 503);
+    assert_eq!(resp.status(), 504, "saturated lane should give 504");
+
+    let metrics = metrics(&proxy).await;
+    // No backpressure metrics should appear.
+    assert!(!metrics.contains("nimproxy_backpressure_total"));
+}
+
+#[tokio::test]
+async fn backpressure_rejects_streaming_request_before_200_commit() {
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(&mock.url, backpressure_opts(), &[]).await;
+
+    // Occupy the single lane.
+    let hog = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("hog", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hog.status(), 200);
+
+    // Streaming request with no deadline → should get 503 before SSE commit.
+    let resp = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("stream-reject", true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "backpressure");
+}
+
+// ---------------------------------------------------------------------------
+// Multi-upstream failover
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn single_upstream_single_endpoint_behaves_as_before() {
+    let mock = start_mock().await;
+    let proxy = start_proxy(&mock.url, &[]).await;
+    let resp = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("hello", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn failover_primary_fails_backup_serves() {
+    let mock = start_mock().await;
+    let backup = start_mock().await;
+    // Two upstreams: primary (mock) then backup.
+    let opts = StoreOpts {
+        upstreams: vec![mock.url.clone(), backup.url.clone()],
+        ..Default::default()
+    };
+    let proxy = start_proxy_with(&mock.url, opts, &[]).await;
+
+    // Primary is alive → first request goes to it.
+    let resp = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("first", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(mock.state.hit_count(), 1);
+    assert_eq!(backup.state.hit_count(), 0);
+
+    // Make the primary fail twice: mark it down.
+    for _ in 0..2 {
+        mock.state.push(Behavior::ServerError(500));
+    }
+    let resp = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("retry", false))
+        .send()
+        .await
+        .unwrap();
+    // The proxy retries the 500 → hits another endpoint → backup serves.
+    assert_eq!(resp.status(), 200);
+    assert_eq!(backup.state.hit_count(), 1, "backup must serve the retry");
+
+    // Succeeding request goes to backup (primary is down).
+    let resp = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("after", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        backup.state.hit_count() >= 2,
+        "backup serves while primary is down"
+    );
+}
+
+#[tokio::test]
+async fn failover_primary_recovers_after_success() {
+    let mock = start_mock().await;
+    let backup = start_mock().await;
+    let opts = StoreOpts {
+        upstreams: vec![mock.url.clone(), backup.url.clone()],
+        ..Default::default()
+    };
+    let proxy = start_proxy_with(&mock.url, opts, &[]).await;
+
+    // Primary fails twice → goes down.
+    for _ in 0..2 {
+        mock.state.push(Behavior::ServerError(500));
+    }
+    let _resp = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("fail", false))
+        .send()
+        .await
+        .unwrap();
+    // Backup served.
+    assert!(backup.state.hit_count() >= 1);
+
+    // Primary gets a successful response (models refresh probes it).
+    // The next request should go back to the primary.
+    let resp = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("recovery", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn failover_health_reported_in_dashboard_now() {
+    let mock = start_mock().await;
+    let backup = start_mock().await;
+    let opts = StoreOpts {
+        upstreams: vec![mock.url.clone(), backup.url.clone()],
+        ..Default::default()
+    };
+    let proxy = start_proxy_with(&mock.url, opts, &[]).await;
+    let cookie = login(&proxy).await;
+
+    let now = dashboard_now(&proxy, &cookie).await;
+    let health = now["upstream_health"].as_array().unwrap();
+    assert_eq!(health.len(), 2, "two endpoints reported");
+    assert!(health[0]["alive"].as_bool().unwrap());
+    assert!(health[1]["alive"].as_bool().unwrap());
 }

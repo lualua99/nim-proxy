@@ -163,6 +163,17 @@ capacity, auth state, default window, retention, and SLO without reloading
 the page; if the active preset is the default, its following bounds are
 recomputed.
 
+**Window-occupancy ring gauge.** The "Capacity used · Now" ring (`ringGauge`)
+uses `window_fill / window_capacity` from the `/now` response — the sum of
+each lane's actual sends inside the 61s sliding window vs the calibrated
+admission budget (`Σ effective_rpm`). This is deliberately **decoupled** from
+the 3s poll delta / instantaneous RPM (`rpmNow`) that feeds the "Requests now"
+text and the traffic sparkline: the ring shows real occupancy (a single request
+fills 1 slot, not a projected 20 RPM), while the throughput readout remains
+unchanged. The `per_lane` array exposes per-lane `key`/`in_window`/`effective_rpm`/`rpm`
+for future drill-down views. See
+[capacity-now-window-fill](../../todo/10-capacity-now-window-fill.md).
+
 **Notable derivations, worth recording so they aren't rediscovered:**
 
 - **Delta chips** (the `+8.2%`-style pill on every KPI card) compare the

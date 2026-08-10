@@ -6,6 +6,178 @@ description: Append-only record of ingests, decisions, and maintenance passes.
 
 # Log
 
+## [2026-08-10] ingest — login page beautify (dashboard-aligned theme)
+
+- `src/auth.rs`: `login_html()` rewritten with dashboard-aligned CSS variables
+  (light/dark), Inter font, brand logo + wordmark, theme toggle button,
+  icon-decorated inputs, indigo pill-shaped submit button, radial-gradient
+  background, fadeIn animation, chip.bad error style. `LOGO_PNG_B64` constant
+  added (reuses dashboard's 68×68 base64 logo).
+- `todo/11-login-page-beautify.md`: status → completed; implementation record
+  filled.
+- Verification: 284 tests (173 unit + 111 e2e), fmt + clippy clean.
+
+## [2026-08-10] decision — capacity what-if simulator
+
+- `knowledge/decisions/capacity-simulator.md` (new): decision page; `index.md`
+  row added. Pure-front-end M/M/1 model, backend data endpoint only.
+- `src/governor.rs`: `Governor::view()` returns per-model `ModelView`
+  (model/limit/inflight/blocked) — unlike `limits()`, includes ungoverned
+  models and live in-flight counts.
+- `src/lib.rs`: `GET /api/dashboard/capacity-model` (session-gated on the
+  existing `require_session` layer, no admin check — matches the Capacity tab's
+  permission line). Aggregates the last hour (`CAPACITY_MODEL_WINDOW`) of
+  history: per-key rpm + calibration factors + effective capacity, per-client
+  request totals + shape averages, per-model governor state + operator
+  overrides, and histogram quantiles (queue wait p50/p95, TTFT p50, upstream +
+  tokens/sec means). Helpers `sum_metric`, `quantile_from_totals`,
+  `req_count_to_rpm` — aggregates only, no stored fields, no request content.
+- `src/dashboard.html`: Capacity tab gains a "Capacity what-if" card. Range
+  sliders (keys, rpm/key, client request rate, model gate cap, service time)
+  seeded from the endpoint's "recent observation" values; `simCapacity()`
+  computes throughput = min(key RPM, model gate, client rate), flags the
+  bottleneck, and estimates avg/P95 queue delay via the M/M/1 closed form
+  `W = ρ/(1-ρ) × service time`, labeled "approximation · trend, not a promise".
+- Tests: unit `sum_metric_*`, `quantile_from_totals_*`, `req_count_to_rpm_*`;
+
+## [2026-08-10] ingest — window-occupancy ring gauge (capacity-now-window-fill)
+
+- `src/lib.rs`: `api_dashboard_now` returns `per_lane`, `window_fill`,
+  `window_capacity` — aggregated from `pool.lane_stats()`, zero new locks.
+- `src/dashboard.html`: ring gauge `capRatio` uses `window_fill / window_capacity`;
+  subtitle shows slots, not rpm. "Requests now" text stays RPM. Capacity tab
+  saturation hero also uses window fill. `applyNowConfig` reads new fields.
+- `tests/e2e.rs`: `dashboard_now_window_fill_reflects_real_count_not_rate_extrapolation`
+  — single request → window_fill=1, not extrapolated 20 RPM.
+- `knowledge/architecture/dashboard.md`: Window-occupancy subsection added.
+- `todo/10-capacity-now-window-fill.md`: status → completed.
+  e2e `dashboard_capacity_model_contract_requires_auth_and_returns_aggregates`
+  (401 without session, 200 with, stable structure, empty-data returns nulls
+  rather than 500).
+
+## [2026-08-10] decision — multi-upstream failover
+
+- `knowledge/decisions/multi-upstream-failover.md` (new): decision page;
+  `index.md` row added.
+- `src/upstream.rs` (new): `UpstreamState` (alive/down/failures/cooldown),
+  `UpstreamSelector` (select/rebuild/observe_success/observe_failure), unit
+  tests. `UpstreamState::usable` removed (dead code, selection logic inlined).
+- `src/config.rs`: `Upstream` gains `upstreams: Vec<String>` (default empty),
+  `Upstream::endpoints()` method (fallback to `[base_url]` for backward compat).
+  Validation checks each URL via `check_base_url`. `Config` struct gains
+  `upstreams: Vec<String>`.
+- `src/lib.rs`: `AppState` adds `upstream_selector: Mutex<UpstreamSelector>`,
+  initialized at boot from `cfg.upstreams`. Boot log shows endpoint count.
+  `api_dashboard_now` returns `upstream_health` array.
+- `src/settings.rs`: `commit()` rebuilds the selector on settings save.
+  `UpstreamReq` accepts `upstreams: Vec<String>`. `api_config` returns
+  `upstreams` in the server object.
+- `src/proxy.rs`: `upstream_request` takes `url` instead of `base_url + path`
+  (caller constructs the full URL). `select_upstream()` and `observe_upstream()`
+  helpers. Every upstream exchange in `buffered()`, `streaming()`, and
+  `catalog()` reports success/failure to the selector.
+- `src/dashboard.html`: Settings → Upstream & limits shows the endpoint list
+  (add/remove rows, saved with the base URL). CSS for `.urow`/`.ubtn`.
+- `tests/e2e.rs`: 4 new e2e tests: single-endpoint regression, primary-fails-
+  backup-serves, primary-recovers, health-reported-in-dashboard-now.
+- `tests/support/mod.rs`: `StoreOpts` gains `upstreams: Vec<String>`.
+- Metrics: `nimproxy_upstream_endpoint_health{endpoint}` gauge,
+  `nimproxy_upstream_all_down_total` counter.
+- Verification: `cargo test --lib` 169, `cargo test --test e2e` 109, all green.
+  `cargo fmt` + `cargo clippy --all-targets -- -D warnings` clean.
+
+- `knowledge/decisions/graduated-backpressure.md` (new): decision page.
+- `src/pool.rs`: `Pool::min_wait()` — pure-read ETA computation without side
+  effects. `src/dispatch.rs`: `Dispatcher::eta()` — public API that calls into
+  `min_wait`. Unit tests for empty/full/preferred-lane scenarios.
+- `src/config.rs`: `Limits` gains `backpressure_enabled` (default false) and
+  `backpressure_queue_threshold_eta_secs` (default 20). Validation enforces
+  >= 1. `Config` struct mirrors them as `Duration`.
+- `src/settings.rs`: `LimitsReq` includes both fields.
+- `src/proxy.rs`: `handle()` checks backpressure before streaming/buffered
+  split: if enabled and no deadline, calls `dispatch.eta()`; if ETA >=
+  threshold, returns `backpressure_rejected()` (503 + `Retry-After` +
+  `{"code":"backpressure"}`). Deadline-carrying requests are exempt.
+  Streaming sub-threshold responses carry `X-Nim-Proxy-Eta` header.
+  `backpressure_rejected()` function added.
+- `src/dashboard.html`: Settings → Server shows Backpressure toggle + threshold
+  input. Reliability tab shows "Backpressure (503)" row.
+- `tests/e2e.rs`: 5 e2e tests covering: saturated-lane reject with
+  Retry-After, deadline exemption, streaming ETA header, disabled regression,
+  streaming reject before 200 commit.
+- Metrics: `nimproxy_backpressure_total{kind=eta|reject}`,
+  `nimproxy_backpressure_rejected_eta_seconds` histogram.
+
+## [2026-08-10] ingest — restart-smooth recovery (rate windows + slow-start ramp)
+
+- `src/ratestate.rs` (new): versioned JSONL persistence (`ratestate.jsonl`),
+  atomic tmp+fsync+rename, corrupt/version-mismatch lines dropped lane-by-lane,
+  epoch timestamps (sub-second truncation leans safe), future-cooldown clamping
+  (`MAX_BENCH_AHEAD_SECS`), governor caps with zero-caps elision, ramp
+  freshness gate (`RAMP_STALE_CUTOFF` 5 min). 11 unit tests.
+- `src/pool.rs`: `LaneState` snapshot for serialization, `Pool::restore()`
+  (reassembles enabled/fresh lanes, carries cooldown+factor), `ramp_budget()`
+  for slow-start, `lane_states()` for snapshot, `Calibration::from_factor()`
+  to restore persisted factor. Ramp horizon carried across pool rebuilds.
+  5 unit tests.
+- `src/governor.rs`: `restored()` / `limits()` roundtrip non-zero caps.
+- `src/config.rs`: `RecoveryCfg { ramp_secs (default 60), ramp_factor
+  (default 0.7) }` with validation.
+- `src/settings.rs`: `recovery` admin handler, dirty flag triggers saver tick.
+- `src/lib.rs`: load ratestate at boot, arm ramp if fresh, boot-time
+  `nimproxy_ramp_active` gauge, saver task (1s loop, 30s tick + dirty),
+  clean-shutdown final save (SIGTERM/docker stop flushes exact windows),
+  `api_dashboard_now` ramp fields, `NIMPROXY_RAMP_SECS/FACTOR` env overrides.
+- `src/dashboard.html`: Settings "Restart recovery" card (secs/factor inputs,
+  save-recovery binding), Capacity hero "recovering" amber chip (restored lane
+  count, dropped lanes, time remaining), `applyNowConfig` ramp stubs.
+- Decision page: `decisions/persist-rate-windows-across-restart.md` — epoch
+  conservatism, ramp freshness gate, calibration handoff, clean-shutdown save.
+- E2e tests: `rate_windows_survive_a_restart` (fill window, restart, assert
+  throttled — 504 not 200), `ramp_slows_traffic_after_a_quick_restart`
+  (restart with factor 0.25, assert exactly 2/8 admit, gauge + dashboard
+  ramp indicators).
+- README FAQ: replaces "Rate windows reset on restart" with the new behavior.
+
+## [2026-08-09] ingest — dispatcher policy modes + deadline fold
+
+- `src/dispatch.rs`: the dispatcher grew three scheduling policies behind the
+  single `acquire` entry point — `Fifo` (historical default), `Edf` (queue
+  deadline order, arrival tie-break), `Fair` (per-client weighted rounds with
+  an aging bound for starvation safety). `PolicyState` under
+  `Arc<RwLock<>>` so settings swaps take effect at the next pick; grant
+  pacing `GRANT_GAP` 25ms, poll slice `POLL` 500ms, housekeeping bound
+  `IDLE_POLL` 100ms; single live `nimproxy_dispatch_policy` gauge. Config
+  `dispatch.policy` (fifo/edf/fair, default fifo) edited from the dashboard
+  settings page.
+- `src/proxy.rs`: explicit `X-Nim-Proxy-Deadline-Ms` now folds into the queue
+  deadline as `min(wait_deadline, rd)` — deadline requests fail fast from the
+  queue at their own bound (and order first under EDF) instead of parking to
+  `max_wait`. Queue expiry discriminated: when the explicit deadline is the
+  binding bound the 504/in-stream terminal reports `deadline_exceeded` (+
+  `record_deadline` counter path), otherwise the saturated-pool `rate_limited`
+  flavor.
+- `src/lib.rs` + `src/settings.rs`: dashboard Queue/Settings surface the
+  policy; `operator_check` now returns `Box<Response>` to shrink the large
+  error value.
+- New decision page [dispatcher-policy-modes](decisions/dispatcher-policy-modes.md);
+  [explicit-request-deadline](decisions/explicit-request-deadline.md) and
+  [global-fifo-dispatcher](decisions/global-fifo-dispatcher.md) amended with
+  the fold semantics and policy modes.
+- Toolchain: rustfmt + clippy now installed by the operator locally; both
+  clean (`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`).
+- Verification: `cargo test --lib` 141, `cargo test --test e2e` 98, all green.
+  Load harness with `scripts/mock_nim.py --enforce` zero violations both
+  scenarios: 100 clients × 3 = 300 rpm-scaled requests (upstream 300, keys
+  {k1:105,k2:95,k3:100}, p95 63.78s), and the governor scenario 30 × 3 = 90
+  requests under `--worker-slots 8` (upstream 90 {31,29,30}, peak workers
+  {r1:7, kimi:3, llama:8}, p95 1.27s).
+- Debugging note: a stray duplicate `reserve_slot` block in `buffered()` (from
+  an earlier edit) double-charged the slot window per retry-loop iteration —
+  reproduced as instant 504s with empty upstream stats, fixed by removing the
+  leftover block; the reproduction pattern (mock + curl ×3) is worth keeping
+  for future 504-fast-fail triage.
+
 ## [2026-08-09] ingest — per-key calibration (measured ceiling)
 
 - `src/pool.rs`: new `Calibration` per lane — a factor on the configured

@@ -19,6 +19,7 @@ the chronology in [log.md](log.md).
 | [sliding-window-not-token-bucket](decisions/sliding-window-not-token-bucket.md) | Exact 40-per-rolling-60s window; GCRA-style buckets allow a double burst |
 | [window-jitter-margin](decisions/window-jitter-margin.md) | 61s window: load test proved delivery jitter trips a strict upstream at 60s |
 | [global-fifo-dispatcher](decisions/global-fifo-dispatcher.md) | One queue for all clients; polling races starve long waiters |
+| [dispatcher-policy-modes](decisions/dispatcher-policy-modes.md) | The queue schedules by policy: FIFO (default), EDF (deadline order), or Fair (weighted rounds + aging) — swapped live from settings |
 | [sticky-affinity-with-spillover](decisions/sticky-affinity-with-spillover.md) | Conversations pin to one key for prefix cache; throughput beats locality when full |
 | [sse-heartbeats-for-rate-waits](decisions/sse-heartbeats-for-rate-waits.md) | Commit to 200 SSE + comment heartbeats so harnesses never see a 429 |
 | [history-retention-days-not-size](decisions/history-retention-days-not-size.md) | Time-based retention matches report intent; real operation disproved the fixed snapshot-size estimate |
@@ -34,6 +35,10 @@ the chronology in [log.md](log.md).
 | [dependency-update-cooldown](decisions/dependency-update-cooldown.md) | Routine dependency updates wait seven days; security updates remain immediate |
 | [dashboard-model-catalog](decisions/dashboard-model-catalog.md) | A Catalog sidebar tab surfaces the upstream model list via a session-gated /api/models sharing the proxy's TTL cache |
 | [request-queue-and-termination](decisions/request-queue-and-termination.md) | In-memory registry of live requests; admin Queue tab terminates any request with error code -91 |
+| [persist-rate-windows-across-restart](decisions/persist-rate-windows-across-restart.md) | Rate windows + governor caps survive restart via versioned JSONL; fresh restore arms a slow-start ramp |
+| [graduated-backpressure](decisions/graduated-backpressure.md) | Estimate queue wait; accept under threshold (ETA header), reject at or above it (503 + Retry-After). Deadline requests exempt |
+| [multi-upstream-failover](decisions/multi-upstream-failover.md) | Ordered upstream list with passive health detection; fail over when the primary goes down, back when it recovers, zero extra RPM |
+| [capacity-simulator](decisions/capacity-simulator.md) | Pure-front-end what-if simulator in the Capacity tab; M/M/1 closed-form delay, seeded from a `/api/dashboard/capacity-model` endpoint |
 
 ## Research — validated external facts
 
@@ -48,7 +53,7 @@ the chronology in [log.md](log.md).
 | Page | One-liner |
 |---|---|
 | [key-pool](architecture/key-pool.md) | Per-key sliding-window lanes; least-loaded selection; cooldown benching |
-| [dispatcher](architecture/dispatcher.md) | Global FIFO slot queue; abandoned-waiter slot return; affinity accounting |
+| [dispatcher](architecture/dispatcher.md) | Policy slot queue (fifo/edf/fair); abandoned-waiter slot return; affinity accounting |
 | [governor](architecture/governor.md) | Per-model concurrency gate; classifies worker exhaustion apart from 429s and backs off the model, adaptively |
 | [streaming-pipeline](architecture/streaming-pipeline.md) | Heartbeats, retry/failover, absolute deadlines, idle timeout, SSE usage scanning |
 | [metrics-history](architecture/metrics-history.md) | Prometheus registry + versioned JSONL, reset-aware startup index, exact rollups, and atomic retention |

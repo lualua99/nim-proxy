@@ -1,6 +1,6 @@
 # 任务 08：多上游端点故障转移（Multi-upstream failover）
 
-> 状态：提案（未开始）
+> 状态：已完成（implemented）
 > 日期：2026-08-09
 > 需求：当前 upstream 是单一固定 URL（`cfg.base_url`）。NIM 全站限流 /
 > 宕机 / 账号被锁时，整个 pool 一起死。支持一份**有序上游端点列表**：

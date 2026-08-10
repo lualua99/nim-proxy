@@ -285,6 +285,8 @@ pub struct StoreOpts {
     pub clients: Vec<(String, String)>,
     /// (key, rpm) NIM keys, all enabled and owned by TEST_USER.
     pub nim_keys: Vec<(String, usize)>,
+    /// Ordered upstream endpoint list; empty = single-endpoint (`upstream`).
+    pub upstreams: Vec<String>,
     /// Additional users (username, role: "admin" | "user"), all sharing
     /// TEST_PASSWORD.
     pub extra_users: Vec<(String, String)>,
@@ -294,6 +296,8 @@ pub struct StoreOpts {
     pub request_timeout_secs: u64,
     pub max_inflight: usize,
     pub strict_passthrough: bool,
+    pub backpressure_enabled: bool,
+    pub backpressure_queue_threshold_eta_secs: u64,
 }
 
 impl Default for StoreOpts {
@@ -306,6 +310,7 @@ impl Default for StoreOpts {
                 ("test-key-1".into(), 40),
                 ("test-key-2".into(), 40),
             ],
+            upstreams: Vec::new(),
             extra_users: Vec::new(),
             max_wait_secs: 30,
             heartbeat_secs: 1,
@@ -313,6 +318,8 @@ impl Default for StoreOpts {
             request_timeout_secs: 300,
             max_inflight: 512,
             strict_passthrough: false,
+            backpressure_enabled: false,
+            backpressure_queue_threshold_eta_secs: 20,
         }
     }
 }
@@ -331,6 +338,7 @@ impl StoreOpts {
             "version": 1,
             "upstream": {
                 "base_url": upstream,
+                "upstreams": self.upstreams,
                 "nim_keys": self.nim_keys.iter().map(|(k, rpm)| serde_json::json!({
                     "key": k, "owner": TEST_USER, "enabled": true, "rpm": rpm
                 })).collect::<Vec<_>>(),
@@ -348,6 +356,8 @@ impl StoreOpts {
                 "request_timeout_secs": self.request_timeout_secs,
                 "max_inflight": self.max_inflight,
                 "strict_passthrough": self.strict_passthrough,
+                "backpressure_enabled": self.backpressure_enabled,
+                "backpressure_queue_threshold_eta_secs": self.backpressure_queue_threshold_eta_secs,
             },
             "users": users,
         })

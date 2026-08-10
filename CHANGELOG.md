@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Capacity used · Now ring gauge switched to window occupancy**: the
+  Overview ring chart now shows real slot fill (`window_fill / window_capacity`)
+  instead of a rate extrapolation from the 3s poll delta. A single request
+  shows ~0% instead of 50%. The "Requests now" text and traffic sparkline
+  keep their instantaneous-RPM semantics. `GET /api/dashboard/now` gains
+  `per_lane`, `window_fill`, and `window_capacity` fields.
+  See [todo/10-capacity-now-window-fill.md](todo/10-capacity-now-window-fill.md).
+
+- **Capacity what-if simulator**: the Capacity tab can now answer "what if I
+  add keys / remove clients / widen the model gate?" with a pure-front-end
+  simulator. Sliders (keys, rpm per key, client request rate, model concurrency
+  cap, service time) are seeded from a new session-gated
+  `GET /api/dashboard/capacity-model` endpoint that aggregates the last hour of
+  existing observations — per-key budgets and calibration, per-client request
+  shape, per-model governor state, and histogram quantiles (queue wait, TTFT,
+  upstream time). The JS model reports projected throughput, the bottleneck
+  (key window / model gate / client rate), utilization, and an approximate
+  M/M/1 avg/P95 queue delay — clearly labeled a trend estimate, not a promise.
+  No new stored fields, no request content, no admin-only check (any user who
+  can see Capacity can use it).
+- **Multi-upstream failover**: the proxy now supports an *ordered* list of
+  upstream endpoints instead of a single fixed base URL. The primary is
+  preferred while healthy; when it fails (connect error, repeated 5xx, or a
+  site-wide throttle), requests automatically fail over to the next healthy
+  endpoint, and back when the primary recovers. Health is **passively
+  observed** — it reuses the periodic `/v1/models` catalog refresh and every
+  real request, so there is zero added RPM budget (no dedicated health-check
+  pings). Two consecutive failures mark an endpoint down for a 60-second
+  cooldown; a single success brings it back. Configured from Settings →
+  Upstream & limits (an ordered list — add/remove rows, primary first) or the
+  `upstreams` key in the config store; a single endpoint (the old `base_url`)
+  remains fully supported. The dashboard's live view reports per-endpoint
+  health; new metrics `nimproxy_upstream_endpoint_health{endpoint}` and
+  `nimproxy_upstream_all_down_total`.
+- **Graduated backpressure (queue ETA + Retry-After rejections)**: the
+  previously binary choice between "wait in the queue forever" and a cold
+  `max_inflight` 503 is now a gradient. When enabled (default off, live from
+  Settings → Server), a request whose *estimated* queue wait exceeds
+  `backpressure_queue_threshold_eta_secs` (default 20 s) is rejected before
+  joining the queue with `503` + `Retry-After: <secs>` and error
+  `{"code":"backpressure"}` — so harnesses can back off instead of dying in
+  line or waiting blind. Requests carrying an explicit
+  `X-Nim-Proxy-Deadline-Ms` are exempt (they already have a binding bound).
+  Requests under the threshold keep the heartbeat behavior, and streaming
+  responses that will queue carry an informational `X-Nim-Proxy-Eta: <secs>`
+  header. The estimate is best-effort (real wait depends on policy and
+  concurrent arrivals), never a promise. New metrics
+  `nimproxy_backpressure_total{kind=eta|reject}` and
+  `nimproxy_backpressure_rejected_eta_seconds`; the Reliability tab shows a
+  "Backpressure (503)" row.
 - **Request Queue sidebar tab with operator termination**: the dashboard now
   lists every in-flight request (client · model · path · phase · age) behind
   a **Queue** tab that only admins see, and admin can terminate any request —
@@ -52,6 +102,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shrink/probe. Conservative by construction: never above the configured
   rpm (calibration only corrects over- and under-use), never zero
   (`effective_rpm` floors at 1 so the window math can't dead-lock).
+- **Restart-smooth recovery (rate windows + slow-start ramp)**: per-key rate
+  windows and governor caps persist to `DATA_DIR/ratestate.jsonl` (versioned
+  JSONL, atomic tmp+fsync+rename, corrupt lines dropped lane-by-lane) on a
+  30s tick, on settings changes, and on clean shutdown. A restart restores
+  the windows and caps as they stood, so a still-full key stays throttled
+  instead of bursting a 429 storm into NIM. While the persisted file is fresh
+  (< 5 min) a slow-start ramp throttles each key to `rate × ramp_factor` for
+  `ramp_secs` (default 60s / 0.7, edited from Settings → Restart recovery),
+  mirroring the upstream's own post-restart relaxation; long-downtime
+  restarts skip the ramp. Ramp is armed only with a fresh restore, and the
+  dashboard's Capacity tile shows a "recovering" chip (`restored_lanes`,
+  `dropped_lanes`, time remaining) plus new `nimproxy_ramp_active` /
+  `nimproxy_restore_count{outcome}` metrics. `NIMPROXY_RAMP_SECS` /
+  `NIMPROXY_RAMP_FACTOR` override the stored ramp at boot.
 
 ### Changed
 

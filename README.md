@@ -170,7 +170,8 @@ fixed-size estimate was wrong—so monitor the displayed history-file size for
 your workload.
 
 **Settings.** Everything app-level is managed here: NIM keys (per-key rpm,
-enable/disable), client API keys, the open/keyed API mode, upstream URL,
+enable/disable), client API keys, the open/keyed API mode, upstream URL and
+ordered failover list,
 limits, pricing, default dashboard window, history retention, availability
 SLO, the model-pressure governor, and users. Saves validate, persist, and apply
 live. The config file itself is read at boot; an out-of-band edit to
@@ -184,6 +185,7 @@ live. The config file itself is read at boot; an out-of-band edit to
 - **One queue for all clients.** Any number of harnesses share the lane pool through a global FIFO dispatcher: slots are granted strictly in arrival order, no client can starve another, and a client that disconnects while queued returns its slot.
 - **Sticky conversations, spread bursts.** Each conversation prefers the same lane every turn, keeping any server-side [prefix cache](https://docs.nvidia.com/nim/large-language-models/latest/kv-cache-reuse.html) warm on one key. When that lane is full the request spills to the least-loaded ready lane — the API is stateless, so crossing keys is always safe, just potentially a cold cache.
 - **Heartbeats instead of failures.** For streaming requests the proxy commits to `200 text/event-stream` immediately and emits SSE comment lines (`: heartbeat` — ignored by every OpenAI client) while it waits for a slot or rides out upstream 429/500/502/503/504 with `Retry-After` honored and instant failover between keys. Streams that stall mid-generation are cut after the `stream_idle` limit.
+- **Multi-upstream failover.** An ordered list of upstream endpoints — the primary is preferred while healthy; failures trigger automatic failover to the next healthy endpoint, with zero extra health-check budget (health is passively observed from real traffic).
 - **Optional absolute deadlines.** `X-Nim-Proxy-Deadline-Ms` bounds the whole request independently of heartbeats or socket activity. Expiry cancels queue/retry/upstream work and releases its lane, model, and in-flight ownership.
 - **Model-pressure aware.** NIM caps per-model worker concurrency independently of the 40 RPM key limit; the proxy detects that specific exhaustion, backs off the affected *model* adaptively (never wasting healthy key capacity on failover), and surfaces it on the dashboard — see [architecture: governor](knowledge/architecture/governor.md).
 - **Pass-through with one exception.** Bodies are forwarded untouched, except: streaming chat requests get `stream_options: {"include_usage": true}` injected so token accounting is exact rather than estimated. If a model rejects the field, the proxy retries untouched and never injects for that model again. `strict_passthrough` in Settings disables injection entirely.
@@ -339,7 +341,7 @@ It exits non-zero on any client-visible failure or a single upstream rate violat
 - **Is this against NVIDIA's ToS? It's designed not to be.** The proxy never exceeds any key's rate limit — that's its entire purpose. Keys are issued per developer account; whether you pool keys with friends is between you and [NVIDIA's terms](https://www.nvidia.com/en-us/agreements/) — the proxy just guarantees each key behaves.
 - **Non-streaming requests can't be heartbeated** (no wire format for it) — they wait silently through pacing/retries up to the `max_wait` limit. Agent harnesses stream, so this rarely matters.
 - **One instance per key set.** Rate state is in-memory; two replicas sharing keys would each assume the full 40 RPM. Run one instance (it comfortably saturates far more keys than you can register).
-- **Rate windows reset on restart.** A restart right after heavy traffic can draw a burst of 429s — the retry machinery absorbs them invisibly.
+- **Rate windows survive a restart — no more restart-429 burst.** Rate windows are persisted to disk (30s tick, on settings changes, and on clean shutdown). A restart restores the windows exactly as they stood, so a still-full key stays throttled across the restart. While the persisted state is fresh (< 5 min) a slow-start ramp throttles each key to `rate × ramp_factor` for `ramp_secs` (default 60s / 0.7, edited from Settings → Restart recovery), mirroring the upstream's own post-restart relaxation. Long-downtime restarts skip the ramp.
 - **Dashboard history is sample-precise, not event-precise.** Following,
   fixed, and All-retained views can all be rebuilt from server history after
   refresh/restart, though the UI selection itself resets to the default.
