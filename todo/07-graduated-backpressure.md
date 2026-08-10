@@ -1,7 +1,8 @@
 # 任务 07：渐进式背压：排队 ETA + 带 Retry-After 的拒绝（Graduated backpressure）
 
-> 状态：提案（未开始）
+> 状态：已完成
 > 日期：2026-08-09
+> 完成日期：2026-08-10
 > 需求：现在的熔断是"冷"的——`max_inflight` 超限直接 503
 > （`proxy.rs:505-519`，`overloaded()` 在 `:1380`，无重试建议），而限流队列
 > 里排队的人只有心跳、没有任何 ETA 信息。把"排队"与"拒绝"变成一条梯度：
@@ -91,5 +92,18 @@
   心跳"的主承诺 —— 背压是**代理层**的反馈，不冒充上游。
 - **与 isolate 相关**：背压与 deadline 的交互必须先于 205 的 fault-less
   桥接（无 deadline 的大等待者）。
+
+---
+
+## 实施记录
+
+### 2026-08-10 — 全部完成
+
+**核心代码**：
+- `src/proxy.rs`：排队前检查背压（`backpressure_enabled`，默认关，Settings → Server 实时开关）——估算队列等待超过 `backpressure_queue_threshold_eta_secs`（默认 20s）且无显式 deadline 的请求，在加入队列前即以 `503` + `Retry-After: <secs>` + `{"code":"backpressure"}` 拒绝；低于阈值的保持心跳行为，流式响应推 `X-Nim-Proxy-Eta: <secs>` 信息头。带 `X-Nim-Proxy-Deadline-Ms` 的请求豁免（已有绑定边界）。
+- `src/config.rs`/`src/settings.rs`：`backpressure_enabled`、`backpressure_queue_threshold_eta_secs` 配置项与 Settings UI。
+- metrics：`nimproxy_backpressure_total{kind=eta|reject}`、`nimproxy_backpressure_rejected_eta_seconds`；Reliability 页新增"Backpressure (503)"行。
+- 决策页 `knowledge/decisions/graduated-backpressure.md`（ADR）；`knowledge/index.md` 与 `knowledge/log.md` 更新；CHANGELOG [Unreleased] Added 条目。
+- 验证：fmt/clippy 干净，全量测试（164 lib + 111 e2e）通过。
 
 ---
