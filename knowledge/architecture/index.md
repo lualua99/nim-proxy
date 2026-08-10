@@ -7,7 +7,7 @@ description: How each component works and why it's shaped that way.
 # Architecture
 
 Request lifecycle: client → [client-auth](client-auth.md) →
-[dispatcher](dispatcher.md) (FIFO slot queue) → [key-pool](key-pool.md)
+[dispatcher](dispatcher.md) (policy slot queue: fifo/edf/fair) → [key-pool](key-pool.md)
 (per-key sliding window) → [governor](governor.md) (per-model admission) →
 upstream, with the
 [streaming-pipeline](streaming-pipeline.md) keeping the client alive

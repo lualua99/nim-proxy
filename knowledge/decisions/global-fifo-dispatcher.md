@@ -40,3 +40,8 @@ returned to the pool via `Pool::release`.
 - Fail-fast: if the soonest possible slot lies beyond the waiter's deadline,
   the waiter is dropped immediately (client gets a 504 / in-stream error)
   rather than waiting pointlessly.
+
+Since July 2026, arrival order is one of three selectable [dispatcher
+policies](dispatcher-policy-modes.md): `fifo` (this page's design, still the
+default and byte-for-byte the historical behavior), `edf` (deadline-ordered),
+and `fair` (per-client weighted rounds with an aging bound).

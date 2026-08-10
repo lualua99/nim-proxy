@@ -43,8 +43,25 @@ and in-flight ownership through existing RAII guards.
 Buffered expiry returns HTTP 504 with `deadline_exceeded`. A stream has already
 committed HTTP 200, so it gets a terminal SSE error with that code when channel
 capacity permits; delivery is best-effort so a slow downstream cannot delay
-cleanup. Invalid headers fail with `invalid_deadline` after normal client auth
-and before upstream admission.
+cleanup. Invalid headers reject with `invalid_deadline` after normal client
+auth and before upstream admission.
+
+### Deadline applies to queueing too
+
+The queue wait deadline is the earlier of the patient default `max_wait` and
+the explicit deadline (`min(wait_deadline, rd)`), so a deadline-carrying
+request never queues past its own budget — under EDF (see [dispatcher
+policies](dispatcher-policy-modes.md)) that folded instant is the ordering
+key, and under every policy a header-deadline request whose queue bound lapses
+fails fast instead of parking until `max_wait`.
+
+One 504 now covers two expiry meanings, and the flavor reports which bound
+actually enforced: when the explicit deadline IS the binding bound, queue
+expiry reports `deadline_exceeded` (and counts
+`nimproxy_deadline_exceeded_total` via the same `record_deadline` path);
+when only the default `max_wait` lapsed, the response stays the saturated-pool
+`rate_limited` flavor. Streaming requests carry the same discrimination into
+the terminal SSE error payload.
 
 ## Consequences
 
@@ -55,6 +72,8 @@ and before upstream admission.
 - Requests without the header behave exactly as before.
 - Deadline expiry has request status `deadline` and a dedicated
   `nimproxy_deadline_exceeded_total{client,model,path}` counter.
+- The queue treats the folded `min(wait, rd)` as the wait bound, so deadline
+  requests also stop competing for slots sooner under contention.
 - A caller can only shorten its own work, so the header is safe in open mode.
 - The feature does not provide immediate buffered-disconnect detection; that
   remains a transport limitation.
