@@ -2419,6 +2419,17 @@ function renderServer() {
       </div>
       ${sv.history.compaction_pending ? '<p class="shint" style="color:var(--amber-lt)">compaction pending</p>' : ''}
       <div class="serr" id="history-err"></div>
+    </div>
+    <div class="card mb">
+      <h2>Response caching <button class="pbtn" id="save-cache" style="margin-left:auto">Save</button></h2>
+      <p class="shint">Serve repeat <b>non-streaming</b> requests (chat &amp; embeddings) from memory to skip the rate-limit queue and the upstream call, saving RPM budget. Keyed by model + path + request body. TTL 0 disables caching.</p>
+      <div class="limgrid" style="margin-top:10px">
+        <div><div class="slabel">TTL · 0 = off</div>
+          <span class="rpmwrap" style="display:flex"><input id="sv-cache-ttl" class="sin" style="width:100%;text-align:right" type="number" min="0" max="86400" step="1" value="${+sv.cache.ttl_secs}"><span class="unitl">s</span></span></div>
+        <div><div class="slabel">Max entries</div>
+          <span class="rpmwrap" style="display:flex"><input id="sv-cache-max" class="sin" style="width:100%;text-align:right" type="number" min="0" max="100000" step="1" value="${+sv.cache.max_entries}"><span class="unitl">entries</span></span></div>
+      </div>
+      <div class="serr" id="cache-err"></div>
     </div>`;
   for (const b of $('setbody').querySelectorAll('[data-mode]')) b.addEventListener('click', async () => {
     if (b.dataset.mode === SET.mode) return;
@@ -2541,6 +2552,19 @@ $('sv-strict').addEventListener('click', () =>
       await loadSettings();
       note('history-err', 'Saved.', true);
     } catch (e) { note('history-err', e.message); }
+  });
+  $('save-cache').addEventListener('click', async () => {
+    const ttl = Math.round(+$('sv-cache-ttl').value);
+    const max = Math.round(+$('sv-cache-max').value);
+    if (!isFinite(ttl) || ttl < 0 || ttl > 86400)
+      return note('cache-err', 'TTL must be 0–86400 seconds (0 = off).');
+    if (!isFinite(max) || max < 0 || max > 100000)
+      return note('cache-err', 'Max entries must be 0–100000.');
+    try {
+      await sPost('/api/settings/cache', { ttl_secs: ttl, max_entries: max });
+      await loadSettings();
+      note('cache-err', 'Saved.', true);
+    } catch (e) { note('cache-err', e.message); }
   });
 }
 

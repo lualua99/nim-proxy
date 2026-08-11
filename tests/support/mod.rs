@@ -298,6 +298,11 @@ pub struct StoreOpts {
     pub strict_passthrough: bool,
     pub backpressure_enabled: bool,
     pub backpressure_queue_threshold_eta_secs: u64,
+    /// Response cache TTL in seconds; 0 = disabled (default, to not break
+    /// existing rate-limit tests).
+    pub cache_ttl_secs: u64,
+    /// Response cache max entries (ignored when TTL is 0).
+    pub cache_max_entries: u64,
 }
 
 impl Default for StoreOpts {
@@ -320,6 +325,8 @@ impl Default for StoreOpts {
             strict_passthrough: false,
             backpressure_enabled: false,
             backpressure_queue_threshold_eta_secs: 20,
+            cache_ttl_secs: 0,
+            cache_max_entries: 1024,
         }
     }
 }
@@ -360,6 +367,10 @@ impl StoreOpts {
                 "backpressure_queue_threshold_eta_secs": self.backpressure_queue_threshold_eta_secs,
             },
             "users": users,
+            "cache": {
+                "ttl_secs": self.cache_ttl_secs,
+                "max_entries": self.cache_max_entries,
+            },
         })
     }
 }

@@ -45,6 +45,8 @@ pub struct StoredConfig {
     #[serde(default)]
     pub dispatch: DispatchCfg,
     #[serde(default)]
+    pub cache: CacheCfg,
+    #[serde(default)]
     pub users: Vec<User>,
 }
 
@@ -315,6 +317,32 @@ impl Default for DispatchCfg {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CacheCfg {
+    /// Response cache TTL in seconds; 0 disables caching.
+    #[serde(default = "default_cache_ttl")]
+    pub ttl_secs: u64,
+    /// Maximum number of entries in the response cache.
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: u64,
+}
+
+impl Default for CacheCfg {
+    fn default() -> Self {
+        Self {
+            ttl_secs: default_cache_ttl(),
+            max_entries: default_cache_max_entries(),
+        }
+    }
+}
+
+fn default_cache_ttl() -> u64 {
+    60
+}
+fn default_cache_max_entries() -> u64 {
+    1024
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct User {
     pub username: String,
     /// `pbkdf2-sha256$<iters>$<salt>$<hash>` (see `auth::hash_password`).
@@ -445,6 +473,8 @@ impl StoredConfig {
                 enabled: self.governor.enabled,
                 overrides: self.governor.overrides.clone(),
             },
+            response_cache_ttl_secs: self.cache.ttl_secs,
+            response_cache_max_entries: self.cache.max_entries,
         }
     }
 }
@@ -680,6 +710,13 @@ pub fn validate(sc: &StoredConfig) -> Result<(), String> {
         if !(1..=1000).contains(weight) {
             return Err(format!("fair weight for {client:?} must be 1-1000"));
         }
+    }
+
+    if sc.cache.ttl_secs > 86_400 {
+        return Err("response cache TTL must be 0..=86400 seconds".into());
+    }
+    if sc.cache.max_entries > 100_000 {
+        return Err("response cache max entries must be 0..=100000".into());
     }
 
     // Ownership + the pool-floor invariant apply once the store is claimed

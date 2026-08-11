@@ -6,6 +6,15 @@ description: Append-only record of ingests, decisions, and maintenance passes.
 
 # Log
 
+## [2026-08-11] decision — response cache for idempotent requests
+
+Added an in-memory response cache (moka) serving repeat non-streaming
+`/v1/chat/completions` and `/v1/embeddings` requests from a SHA256 semantic key,
+skipping the rate-limit queue and upstream call. New `src/cache.rs`,
+`POST /api/settings/cache`, dashboard "Response caching" card, and cache metrics.
+e2e harness `StoreOpts` defaults to cache disabled so existing rate-limit tests
+keep their semantics.
+
 ## [2026-08-10] decision — realtime dashboard push over SSE
 
 - `knowledge/decisions/realtime-dashboard-sse.md` (new): decision page; `index.md`

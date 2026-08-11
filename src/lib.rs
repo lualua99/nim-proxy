@@ -1,4 +1,5 @@
 mod auth;
+mod cache;
 mod config;
 mod dispatch;
 mod governor;
@@ -75,6 +76,10 @@ pub struct Config {
     /// ETA threshold in seconds: requests that would wait this long or longer
     /// are rejected under backpressure (ignored when backpressure is off).
     pub backpressure_queue_threshold_eta: Duration,
+    /// Response cache TTL in seconds; 0 disables caching.
+    pub response_cache_ttl_secs: u64,
+    /// Maximum number of entries in the response cache.
+    pub response_cache_max_entries: u64,
 }
 
 pub struct GovernorSettings {
@@ -144,6 +149,8 @@ pub struct AppState {
     pub started: u64,
     /// Live SSE dashboard-stream connections; bounds memory under many tabs.
     pub sse_connections: AtomicUsize,
+    /// Response cache for idempotent non-streaming requests.
+    pub response_cache: cache::ResponseCache,
 }
 
 impl AppState {
@@ -962,6 +969,10 @@ pub async fn run() {
     let upstream_selector =
         std::sync::Mutex::new(upstream::UpstreamSelector::new(cfg.upstreams.clone()));
 
+    let response_cache_ttl = stored.cache.ttl_secs;
+    let response_cache_max = stored.cache.max_entries;
+    gauge!("nimproxy_cache_entries").set(0.0);
+
     let state = Arc::new(AppState {
         dispatch: Dispatcher::new(pool.clone(), &stored.dispatch),
         pool,
@@ -991,6 +1002,7 @@ pub async fn run() {
         setup_required: std::sync::atomic::AtomicBool::new(setup_required),
         cfg: RwLock::new(Arc::new(cfg)),
         registry: Arc::new(registry::RequestRegistry::new()),
+        response_cache: cache::ResponseCache::new(response_cache_ttl, response_cache_max),
     });
 
     // Rate-state saver: persists the pool's windows + governor caps every
@@ -1021,6 +1033,7 @@ pub async fn run() {
                             0.0
                         },
                     );
+                    gauge!("nimproxy_cache_entries").set(state.response_cache.len() as f64);
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -1056,6 +1069,7 @@ pub async fn run() {
         .route("/api/settings/history", post(settings::history))
         .route("/api/settings/governor", post(settings::governor_cfg))
         .route("/api/settings/recovery", post(settings::recovery))
+        .route("/api/settings/cache", post(settings::cache_cfg))
         .route("/api/settings/dispatch", post(settings::dispatch_cfg))
         .route("/api/settings/users", post(settings::users))
         .route("/api/settings/account", post(settings::account))

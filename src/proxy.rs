@@ -644,6 +644,33 @@ pub async fn handle(
         .as_ref()
         .and_then(|v| affinity(v, state.pool().len()));
 
+    // Fast path: response cache hit for idempotent non-streaming requests.
+    // Skip the rate-limit queue, upstream call, and every downstream step.
+    // The computed key rides along to `buffered` so a miss can be written back
+    // on a successful upstream exchange.
+    let response_cache_key = if !wants_stream && request_deadline.is_none() {
+        let key = state
+            .response_cache
+            .key_for(&ctx.model, &ctx.path, &body, false);
+        if let Some(ref key) = key {
+            if let Some(hit) = state.response_cache.get(key) {
+                metrics::counter!("nimproxy_cache_hits_total", "path" => ctx.path.clone())
+                    .increment(1);
+                record_request(&ctx, hit.status.as_str());
+                return Response::builder()
+                    .status(hit.status)
+                    .header(header::CONTENT_TYPE, &hit.content_type)
+                    .body(axum::body::Body::from(hit.body))
+                    .unwrap();
+            }
+            metrics::counter!("nimproxy_cache_misses_total", "path" => ctx.path.clone())
+                .increment(1);
+        }
+        key
+    } else {
+        None
+    };
+
     // Register in the operator request queue. The entry doubles as the kill
     // switch: an admin can terminate this request and the client sees error
     // code -91. The entry lives for exactly this request's lifetime (RAII).
@@ -747,6 +774,7 @@ pub async fn handle(
             deadline,
             request_deadline,
             registered,
+            response_cache_key,
         );
         if let Some(deadline) = request_deadline {
             match tokio::time::timeout_at(deadline.0.into(), work).await {
@@ -811,6 +839,8 @@ fn queue_expired_sse(
 }
 
 /// Non-streaming: pace, retry, and return the upstream response verbatim.
+/// On success, writes the response into the response cache (when a cache key
+/// is provided) so the same request can be served from cache next time.
 #[allow(clippy::too_many_arguments)]
 async fn buffered(
     state: Arc<AppState>,
@@ -824,6 +854,7 @@ async fn buffered(
     deadline: Instant,
     request_deadline: Option<RequestDeadline>,
     registered: Registered,
+    response_cache_key: Option<String>,
 ) -> Response {
     let _active = crate::dispatch::scopeguard(|| gauge!("nimproxy_active_requests").decrement(1.0));
     gauge!("nimproxy_active_requests").increment(1.0);
@@ -920,7 +951,37 @@ async fn buffered(
             histogram!("nimproxy_upstream_seconds", "model" => ctx.model.clone())
                 .record(sent_at.elapsed().as_secs_f64());
             record_request(&ctx, resp.status().as_str());
-            return relay(resp, &ctx).await;
+            let response = relay(resp, &ctx).await;
+            // Cache the response on success, when a cache key is available.
+            if response.status().is_success() {
+                if let Some(ref key) = response_cache_key {
+                    let content_type = response
+                        .headers()
+                        .get(axum::http::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("application/json")
+                        .to_owned();
+                    let status = response.status();
+                    let body = axum::body::to_bytes(response.into_body(), 64 * 1024 * 1024).await;
+                    if let Ok(body) = body {
+                        state
+                            .response_cache
+                            .set(key, status, content_type.clone(), body.clone());
+                        return Response::builder()
+                            .status(status)
+                            .header(axum::http::header::CONTENT_TYPE, &content_type)
+                            .body(axum::body::Body::from(body))
+                            .unwrap();
+                    }
+                    // Fall through to the non-cached path if to_bytes failed.
+                    return Response::builder()
+                        .status(status)
+                        .header(axum::http::header::CONTENT_TYPE, &content_type)
+                        .body(axum::body::Body::from(Bytes::new()))
+                        .unwrap();
+                }
+            }
+            return response;
         }
     };
     if *kill.borrow() {

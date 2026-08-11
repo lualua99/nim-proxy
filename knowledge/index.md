@@ -40,6 +40,7 @@ the chronology in [log.md](log.md).
 | [multi-upstream-failover](decisions/multi-upstream-failover.md) | Ordered upstream list with passive health detection; fail over when the primary goes down, back when it recovers, zero extra RPM |
 | [capacity-simulator](decisions/capacity-simulator.md) | Pure-front-end what-if simulator in the Capacity tab; M/M/1 closed-form delay, seeded from a `/api/dashboard/capacity-model` endpoint |
 | [realtime-dashboard-sse](decisions/realtime-dashboard-sse.md) | Dashboard swaps 3s polling for a server-sent-events stream (full snapshots, v1); poll kept as fallback, bounded connections |
+| [response-cache](decisions/response-cache.md) | Cache non-streaming idempotent requests (SHA256 key, moka) to skip the rate-limit queue and upstream call, saving RPM |
 
 ## Research — validated external facts
 

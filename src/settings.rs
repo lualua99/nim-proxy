@@ -52,6 +52,12 @@ pub fn commit(
             .clone()
             .reconfigure_retention(candidate.history.days, crate::unix_now());
     }
+    if candidate.cache.ttl_secs != guard.cache.ttl_secs
+        || candidate.cache.max_entries != guard.cache.max_entries
+    {
+        let mut rc = state.response_cache.clone();
+        rc.reconfigure(candidate.cache.ttl_secs, candidate.cache.max_entries);
+    }
     *guard = candidate;
     state.config_revision.fetch_add(1, Ordering::SeqCst);
     Ok(())
@@ -419,6 +425,7 @@ pub async fn api_config(
             "governor": sc.governor,
             "recovery": sc.recovery,
             "dispatch": sc.dispatch,
+            "cache": sc.cache,
         });
         body["users"] = serde_json::json!(sc
             .users
@@ -731,6 +738,21 @@ admin_section!(
     |cand: &mut StoredConfig, req: RecoveryReq| {
         cand.recovery.ramp_secs = req.ramp_secs;
         cand.recovery.ramp_factor = req.ramp_factor;
+    }
+);
+
+#[derive(Deserialize)]
+pub struct CacheReq {
+    ttl_secs: u64,
+    max_entries: u64,
+}
+
+admin_section!(
+    cache_cfg,
+    CacheReq,
+    |cand: &mut StoredConfig, req: CacheReq| {
+        cand.cache.ttl_secs = req.ttl_secs;
+        cand.cache.max_entries = req.max_entries;
     }
 );
 

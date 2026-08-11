@@ -5144,3 +5144,217 @@ async fn failover_health_reported_in_dashboard_now() {
     assert!(health[0]["alive"].as_bool().unwrap());
     assert!(health[1]["alive"].as_bool().unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// Response cache (task 14): idempotent non-streaming requests are served from
+// memory, skipping the rate-limit queue and the upstream call.
+// ---------------------------------------------------------------------------
+
+/// A fixture with the response cache enabled (TTL 60s).
+fn cached() -> StoreOpts {
+    StoreOpts {
+        cache_ttl_secs: 60,
+        cache_max_entries: 1024,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn cache_serves_the_second_identical_request() {
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(&mock.url, cached(), &[]).await;
+
+    for _ in 0..2 {
+        let r = client()
+            .post(proxy.url("/v1/chat/completions"))
+            .json(&chat_body("same", false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+    // The second request is a cache hit: only one upstream call happened.
+    assert_eq!(
+        mock.state.hit_count(),
+        1,
+        "second request must be served from cache"
+    );
+
+    // The cached body is byte-identical to the upstream response.
+    let r1 = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("same", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 200);
+    assert_eq!(mock.state.hit_count(), 1, "still no further upstream call");
+}
+
+#[tokio::test]
+async fn cache_misses_on_different_bodies() {
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(&mock.url, cached(), &[]).await;
+
+    for i in 0..3 {
+        let r = client()
+            .post(proxy.url("/v1/chat/completions"))
+            .json(&chat_body(&format!("distinct {i}"), false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+    // All three are distinct bodies -> no cache hits.
+    assert_eq!(mock.state.hit_count(), 3);
+}
+
+#[tokio::test]
+async fn cache_disabled_sends_every_request_upstream() {
+    let mock = start_mock().await;
+    // cache_ttl_secs defaults to 0 (disabled) in the test harness.
+    let proxy = start_proxy_with(&mock.url, StoreOpts::default(), &[]).await;
+
+    for _ in 0..2 {
+        let r = client()
+            .post(proxy.url("/v1/chat/completions"))
+            .json(&chat_body("same", false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+    assert_eq!(
+        mock.state.hit_count(),
+        2,
+        "cache disabled -> both go upstream"
+    );
+}
+
+#[tokio::test]
+async fn cache_expires_after_ttl() {
+    let mock = start_mock().await;
+    let opts = StoreOpts {
+        cache_ttl_secs: 1,
+        ..Default::default()
+    };
+    let proxy = start_proxy_with(&mock.url, opts, &[]).await;
+
+    let _ = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("same", false))
+        .send()
+        .await
+        .unwrap();
+
+    // Wait past the TTL so the entry is evicted.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let _ = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("same", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.state.hit_count(),
+        2,
+        "expired entry -> fresh upstream call"
+    );
+}
+
+#[tokio::test]
+async fn cache_skips_streaming_requests() {
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(&mock.url, cached(), &[]).await;
+
+    for _ in 0..2 {
+        let r = client()
+            .post(proxy.url("/v1/chat/completions"))
+            .json(&chat_body("same", true))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let _ = read_sse(r).await;
+    }
+    // Streaming requests are never cached.
+    assert_eq!(mock.state.hit_count(), 2);
+}
+
+#[tokio::test]
+async fn cache_skips_deadline_requests() {
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(&mock.url, cached(), &[]).await;
+
+    for _ in 0..2 {
+        let r = client()
+            .post(proxy.url("/v1/chat/completions"))
+            .header("X-Nim-Proxy-Deadline-Ms", "60000")
+            .json(&chat_body("same", false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+    // Deadline requests imply one-shot semantics: never cached.
+    assert_eq!(mock.state.hit_count(), 2);
+}
+
+#[tokio::test]
+async fn cache_hits_show_in_metrics() {
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(&mock.url, cached(), &[]).await;
+
+    for _ in 0..2 {
+        let _ = client()
+            .post(proxy.url("/v1/chat/completions"))
+            .json(&chat_body("same", false))
+            .send()
+            .await
+            .unwrap();
+    }
+    let m = metrics(&proxy).await;
+    assert!(
+        m.contains("nimproxy_cache_hits_total"),
+        "hit counter present:\n{m}"
+    );
+    assert!(
+        m.contains("nimproxy_cache_misses_total"),
+        "miss counter present:\n{m}"
+    );
+    assert!(
+        m.contains("nimproxy_cache_entries"),
+        "entries gauge present:\n{m}"
+    );
+}
+
+#[tokio::test]
+async fn cache_does_not_store_upstream_errors() {
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(&mock.url, cached(), &[]).await;
+
+    // First request: upstream answers a non-retryable 400 (never cached).
+    mock.state.push(Behavior::BadRequest);
+    let r = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("same", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+
+    // Second identical request goes upstream again (400 was not cached).
+    let r2 = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("same", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 200);
+    assert_eq!(
+        mock.state.hit_count(),
+        2,
+        "a non-2xx response must not be cached"
+    );
+}

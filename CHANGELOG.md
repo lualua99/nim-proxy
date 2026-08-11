@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Response cache for idempotent requests**: repeat non-streaming
+  `POST /v1/chat/completions` and `POST /v1/embeddings` requests are served
+  from an in-memory cache (SHA256 semantic key over model + path + body), skipping
+  the rate-limit queue and the upstream call to save RPM budget. Configurable TTL
+  (0 disables) and max entries from the dashboard (Server → Response caching),
+  plus `nimproxy_cache_hits_total` / `nimproxy_cache_misses_total` / `nimproxy_cache_entries`
+  metrics. Requests carrying `X-Nim-Proxy-Deadline-Ms` and streamed requests are
+  never cached. See [todo/14-response-cache.md](todo/14-response-cache.md).
+
 - **Realtime dashboard push over SSE**: the dashboard now uses a Server-Sent
   Events stream (`GET /api/dashboard/stream`) for its 3-second Now-data updates
   instead of polling `/api/dashboard/now`. The new endpoint is session-gated
