@@ -1,13 +1,12 @@
 //! The UI-managed configuration store: `DATA_DIR/config.json`.
 //!
 //! This file is the app's single source of app-level configuration — env
-//! vars cover container-level concerns only (HOST/PORT/DATA_DIR/RUST_LOG/
-//! TRUST_PROXY). It holds credentials (hashed passwords, NIM keys, client-
-//! secret digests), so unlike the telemetry history it gets atomic writes,
-//! 0600 permissions, and a **hard boot error** when unreadable or corrupt:
-//! silently degrading would let wizard-created credentials vanish on restart
-//! and reopen the setup-claim window. A missing file is the one benign case
-//! — that's a fresh install, served by the setup wizard.
+//! vars cover container-level concerns only (HOST/PORT/DATA_DIR/RUST_LOG). It
+//! holds credentials (NIM keys), so unlike the telemetry history it gets
+//! atomic writes, 0600 permissions, and a **hard boot error** when unreadable
+//! or corrupt: silently degrading would let configured keys vanish on
+//! restart. A missing file is the one benign case — that's a fresh install,
+//! served with defaults.
 //!
 //! The settings handlers are the only writer; every consumer reads immutable
 //! snapshots (see `AppState::cfg`), so there is no file watching or reload.
@@ -29,8 +28,6 @@ pub struct StoredConfig {
     #[serde(default)]
     pub upstream: Upstream,
     #[serde(default)]
-    pub client_auth: ClientAuth,
-    #[serde(default)]
     pub limits: Limits,
     #[serde(default)]
     pub pricing: Pricing,
@@ -44,10 +41,6 @@ pub struct StoredConfig {
     pub recovery: RecoveryCfg,
     #[serde(default)]
     pub dispatch: DispatchCfg,
-    #[serde(default)]
-    pub cache: CacheCfg,
-    #[serde(default)]
-    pub users: Vec<User>,
 }
 
 impl Default for StoredConfig {
@@ -98,43 +91,10 @@ impl Upstream {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NimKey {
     pub key: String,
-    pub owner: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_rpm")]
     pub rpm: usize,
-}
-
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
-pub struct ClientAuth {
-    #[serde(default)]
-    pub mode: Mode,
-    #[serde(default)]
-    pub keys: Vec<ClientKey>,
-}
-
-/// Whether `/v1` requires a client API key. `Keyed` with zero keys rejects
-/// everything — fail closed; the dashboard prompts to create a key.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    Open,
-    #[default]
-    Keyed,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ClientKey {
-    /// Metric label for this harness (charset-checked by `validate`).
-    pub name: String,
-    /// SHA-256 hex of the bearer secret. The secret itself is shown exactly
-    /// once at creation and never stored — a leaked store leaks no tokens.
-    pub secret_sha256: String,
-    /// Last four characters of the secret, for masked display only
-    /// (a 4-char tail of a 128-bit random token gives away nothing useful).
-    #[serde(default)]
-    pub last4: String,
-    pub owner: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -153,10 +113,6 @@ pub struct Limits {
     pub max_inflight: usize,
     #[serde(default)]
     pub strict_passthrough: bool,
-    #[serde(default)]
-    pub backpressure_enabled: bool,
-    #[serde(default = "default_backpressure_threshold")]
-    pub backpressure_queue_threshold_eta_secs: u64,
 }
 
 impl Default for Limits {
@@ -264,24 +220,21 @@ fn default_ramp_factor() -> f64 {
 /// Slot-scheduling policy for the rate-limit dispatcher. `Fifo` is the
 /// historical behavior (strict arrival order); `Edf` serves the earliest
 /// queue deadline first (requests with an explicit
-/// `X-Nim-Proxy-Deadline-Ms` jump the line); `Fair` rotates per-client slot
-/// quotas with wait-aging so no client can starve another.
+/// `X-Nim-Proxy-Deadline-Ms` jump the line).
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DispatchPolicy {
     #[default]
     Fifo,
     Edf,
-    Fair,
 }
 
 impl DispatchPolicy {
-    /// The enum as a metric/config label ("fifo" | "edf" | "fair").
+    /// The enum as a metric/config label ("fifo" | "edf").
     pub fn as_str(self) -> &'static str {
         match self {
             DispatchPolicy::Fifo => "fifo",
             DispatchPolicy::Edf => "edf",
-            DispatchPolicy::Fair => "fair",
         }
     }
 }
@@ -296,73 +249,13 @@ impl std::fmt::Display for DispatchPolicy {
 pub struct DispatchCfg {
     #[serde(default)]
     pub policy: DispatchPolicy,
-    /// Waiters older than this are served at highest priority under `Fair`
-    /// (the anti-starvation bound).
-    #[serde(default = "default_fair_aging")]
-    pub fair_aging_secs: u64,
-    /// Per-client weight overrides for `Fair` (client name -> weight). Absent
-    /// clients get a stable hash-derived weight.
-    #[serde(default)]
-    pub fair_weights: HashMap<String, usize>,
 }
 
 impl Default for DispatchCfg {
     fn default() -> Self {
         Self {
             policy: DispatchPolicy::Fifo,
-            fair_aging_secs: default_fair_aging(),
-            fair_weights: HashMap::new(),
         }
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct CacheCfg {
-    /// Response cache TTL in seconds; 0 disables caching.
-    #[serde(default = "default_cache_ttl")]
-    pub ttl_secs: u64,
-    /// Maximum number of entries in the response cache.
-    #[serde(default = "default_cache_max_entries")]
-    pub max_entries: u64,
-}
-
-impl Default for CacheCfg {
-    fn default() -> Self {
-        Self {
-            ttl_secs: default_cache_ttl(),
-            max_entries: default_cache_max_entries(),
-        }
-    }
-}
-
-fn default_cache_ttl() -> u64 {
-    60
-}
-fn default_cache_max_entries() -> u64 {
-    1024
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct User {
-    pub username: String,
-    /// `pbkdf2-sha256$<iters>$<salt>$<hash>` (see `auth::hash_password`).
-    pub password_hash: String,
-    pub role: Role,
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    /// An admin that can never be deleted (so the last admin can't vanish).
-    Superuser,
-    Admin,
-    User,
-}
-
-impl Role {
-    /// Server settings + user management.
-    pub fn is_admin(self) -> bool {
-        matches!(self, Role::Superuser | Role::Admin)
     }
 }
 
@@ -411,22 +304,7 @@ fn default_dashboard_window_days() -> u64 {
 fn default_slo_target_percent() -> f64 {
     99.9
 }
-fn default_fair_aging() -> u64 {
-    60
-}
-fn default_backpressure_threshold() -> u64 {
-    20
-}
-
 impl StoredConfig {
-    pub fn superuser(&self) -> Option<&User> {
-        self.users.iter().find(|u| u.role == Role::Superuser)
-    }
-
-    pub fn user(&self, username: &str) -> Option<&User> {
-        self.users.iter().find(|u| u.username == username)
-    }
-
     /// Every stored key as a pool lane spec. Disabled keys ride along as
     /// state carriers so a disable→enable cycle can't reset their windows.
     pub fn pool_specs(&self) -> Vec<crate::pool::LaneSpec> {
@@ -454,27 +332,11 @@ impl StoredConfig {
             strict_passthrough: self.limits.strict_passthrough,
             price_in: self.pricing.ref_price_in,
             price_out: self.pricing.ref_price_out,
-            clients: match self.client_auth.mode {
-                Mode::Open => None,
-                Mode::Keyed => Some(
-                    self.client_auth
-                        .keys
-                        .iter()
-                        .map(|k| (k.secret_sha256.clone(), k.name.clone()))
-                        .collect(),
-                ),
-            },
             max_inflight: self.limits.max_inflight,
-            backpressure_enabled: self.limits.backpressure_enabled,
-            backpressure_queue_threshold_eta: Duration::from_secs(
-                self.limits.backpressure_queue_threshold_eta_secs,
-            ),
             governor: crate::GovernorSettings {
                 enabled: self.governor.enabled,
                 overrides: self.governor.overrides.clone(),
             },
-            response_cache_ttl_secs: self.cache.ttl_secs,
-            response_cache_max_entries: self.cache.max_entries,
         }
     }
 }
@@ -545,16 +407,6 @@ pub fn save(dir: &Path, sc: &StoredConfig) -> io::Result<()> {
     Ok(())
 }
 
-/// The label charset shared by client-key names and usernames — they appear
-/// in metrics and logs, so they get the same conservative treatment as
-/// model labels (see `proxy::sanitize_label`).
-fn label_ok(s: &str, max: usize) -> bool {
-    !s.is_empty()
-        && s.len() <= max
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-}
-
 /// Guard an upstream URL: require an http(s) scheme, and refuse the
 /// link-local range (169.254.0.0/16 and IPv6 fe80::/10) — that's the cloud
 /// metadata endpoint (169.254.169.254) and has no legitimate NIM use, so
@@ -598,9 +450,6 @@ pub fn validate(sc: &StoredConfig) -> Result<(), String> {
     if l.max_inflight == 0 {
         return Err("max_inflight must be >= 1".into());
     }
-    if l.backpressure_queue_threshold_eta_secs == 0 {
-        return Err("backpressure_queue_threshold_eta_secs must be >= 1".into());
-    }
     if !sc.pricing.ref_price_in.is_finite()
         || !sc.pricing.ref_price_out.is_finite()
         || sc.pricing.ref_price_in < 0.0
@@ -625,31 +474,6 @@ pub fn validate(sc: &StoredConfig) -> Result<(), String> {
         check_base_url(url)?;
     }
 
-    let mut names = std::collections::HashSet::new();
-    for u in &sc.users {
-        if !label_ok(&u.username, 32) {
-            return Err(format!(
-                "username {:?} must be 1-32 chars of letters, digits, '.', '_' or '-'",
-                u.username
-            ));
-        }
-        if !names.insert(u.username.as_str()) {
-            return Err(format!("duplicate username {:?}", u.username));
-        }
-        if u.password_hash.is_empty() {
-            return Err(format!("user {:?} has an empty password hash", u.username));
-        }
-    }
-    if sc
-        .users
-        .iter()
-        .filter(|u| u.role == Role::Superuser)
-        .count()
-        > 1
-    {
-        return Err("only one superuser may exist".into());
-    }
-
     let mut keys = std::collections::HashSet::new();
     for k in &sc.upstream.nim_keys {
         if k.key.trim().is_empty() {
@@ -660,25 +484,6 @@ pub fn validate(sc: &StoredConfig) -> Result<(), String> {
         }
         if !(1..=10_000).contains(&k.rpm) {
             return Err(format!("NIM key rpm {} out of range 1-10000", k.rpm));
-        }
-    }
-
-    let mut client_names = std::collections::HashSet::new();
-    for c in &sc.client_auth.keys {
-        if !label_ok(&c.name, 64) {
-            return Err(format!(
-                "client key name {:?} must be 1-64 chars of letters, digits, '.', '_' or '-'",
-                c.name
-            ));
-        }
-        if !client_names.insert(c.name.as_str()) {
-            return Err(format!("duplicate client key name {:?}", c.name));
-        }
-        if c.secret_sha256.len() != 64 || !c.secret_sha256.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(format!(
-                "client key {:?} secret digest is not 64 hex chars",
-                c.name
-            ));
         }
     }
 
@@ -695,57 +500,6 @@ pub fn validate(sc: &StoredConfig) -> Result<(), String> {
     }
     if !(0.0 < sc.recovery.ramp_factor && sc.recovery.ramp_factor <= 1.0) {
         return Err("recovery ramp_factor must be in (0, 1]".into());
-    }
-
-    if sc.dispatch.fair_aging_secs == 0 {
-        return Err("fair_aging_secs must be >= 1".into());
-    }
-    for (client, weight) in &sc.dispatch.fair_weights {
-        if !label_ok(client, 64) {
-            return Err(format!(
-                "fair weight client {:?} must be 1-64 chars of letters, digits, '.', '_' or '-'",
-                client
-            ));
-        }
-        if !(1..=1000).contains(weight) {
-            return Err(format!("fair weight for {client:?} must be 1-1000"));
-        }
-    }
-
-    if sc.cache.ttl_secs > 86_400 {
-        return Err("response cache TTL must be 0..=86400 seconds".into());
-    }
-    if sc.cache.max_entries > 100_000 {
-        return Err("response cache max entries must be 0..=100000".into());
-    }
-
-    // Ownership + the pool-floor invariant apply once the store is claimed
-    // (has a superuser). A recovery store — users hand-emptied on the volume
-    // — legitimately holds orphan-owned keys until the wizard reassigns them.
-    if let Some(su) = sc.superuser() {
-        for k in &sc.upstream.nim_keys {
-            if sc.user(&k.owner).is_none() {
-                return Err(format!("NIM key owner {:?} is not a user", k.owner));
-            }
-        }
-        for c in &sc.client_auth.keys {
-            if sc.user(&c.owner).is_none() {
-                return Err(format!(
-                    "client key {:?} owner {:?} is not a user",
-                    c.name, c.owner
-                ));
-            }
-        }
-        if !sc
-            .upstream
-            .nim_keys
-            .iter()
-            .any(|k| k.enabled && k.owner == su.username)
-        {
-            return Err(
-                "the superuser must own at least one enabled NIM key (the pool floor)".into(),
-            );
-        }
     }
     Ok(())
 }
@@ -775,19 +529,14 @@ mod tests {
         }
     }
 
-    fn claimed() -> StoredConfig {
+    /// A default-valid store with one NIM key (the minimal working shape).
+    fn store_with_key() -> StoredConfig {
         StoredConfig {
-            users: vec![User {
-                username: "root".into(),
-                password_hash: "pbkdf2-sha256$1000$aa$bb".into(),
-                role: Role::Superuser,
-            }],
             upstream: Upstream {
                 base_url: default_base_url(),
                 upstreams: Vec::new(),
                 nim_keys: vec![NimKey {
                     key: "nvapi-one".into(),
-                    owner: "root".into(),
                     enabled: true,
                     rpm: 40,
                 }],
@@ -827,19 +576,16 @@ mod tests {
         assert_eq!(sc.version, 1);
         assert_eq!(sc.limits.max_wait_secs, 900);
         assert_eq!(sc.limits.heartbeat_secs, 10);
-        assert_eq!(sc.client_auth.mode, Mode::Keyed, "fail closed by default");
         assert!(sc.governor.enabled);
-        assert!(sc.superuser().is_none(), "no users -> setup mode");
         validate(&sc).expect("a fresh store is valid");
     }
 
     #[test]
     fn save_load_round_trips() {
         let dir = TestDir::new();
-        let sc = claimed();
+        let sc = store_with_key();
         save(&dir.0, &sc).unwrap();
         let loaded = load(&dir.0).unwrap().expect("store exists");
-        assert_eq!(loaded.users[0].username, "root");
         assert_eq!(loaded.upstream.nim_keys[0].rpm, 40);
         let specs = loaded.pool_specs();
         assert_eq!(specs.len(), 1);
@@ -851,7 +597,7 @@ mod tests {
     fn saved_store_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let dir = TestDir::new();
-        save(&dir.0, &claimed()).unwrap();
+        save(&dir.0, &store_with_key()).unwrap();
         let mode = fs::metadata(store_path(&dir.0))
             .unwrap()
             .permissions()
@@ -860,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_store_is_setup_mode_not_error() {
+    fn missing_store_loads_as_none() {
         let dir = TestDir::new();
         assert!(load(&dir.0).unwrap().is_none());
     }
@@ -887,46 +633,22 @@ mod tests {
     fn serde_defaults_fill_omitted_fields() {
         // A NIM key missing enabled/rpm inherits the documented defaults
         // (backward compat for stores written before those fields existed).
-        let k: NimKey = serde_json::from_str(r#"{"key":"k","owner":"o"}"#).unwrap();
+        let k: NimKey = serde_json::from_str(r#"{"key":"k"}"#).unwrap();
         assert!(k.enabled);
         assert_eq!(k.rpm, 40);
         let g: GovernorCfg = serde_json::from_str("{}").unwrap();
         assert!(g.enabled);
         let d: DispatchCfg = serde_json::from_str("{}").unwrap();
         assert_eq!(d.policy, DispatchPolicy::Fifo, "fail-safe default");
-        assert_eq!(d.fair_aging_secs, 60);
-        assert!(d.fair_weights.is_empty());
     }
 
     #[test]
     fn dispatch_policy_labels_match_serde_names() {
         assert_eq!(DispatchPolicy::Fifo.as_str(), "fifo");
         assert_eq!(DispatchPolicy::Edf.as_str(), "edf");
-        assert_eq!(DispatchPolicy::Fair.as_str(), "fair");
-        let round: DispatchPolicy = serde_json::from_str(r#""fair""#).unwrap();
-        assert_eq!(round, DispatchPolicy::Fair);
+        let round: DispatchPolicy = serde_json::from_str(r#""edf""#).unwrap();
+        assert_eq!(round, DispatchPolicy::Edf);
         assert!(serde_json::from_str::<DispatchPolicy>(r#""lifo""#).is_err());
-    }
-
-    #[test]
-    fn dispatch_validation_bounds_aging_and_weights() {
-        let mut sc = claimed();
-        sc.dispatch.fair_aging_secs = 0;
-        assert_eq!(validate(&sc).unwrap_err(), "fair_aging_secs must be >= 1");
-        sc.dispatch.fair_aging_secs = 60;
-        sc.dispatch.fair_weights.insert("opencode".into(), 1001);
-        assert_eq!(
-            validate(&sc).unwrap_err(),
-            "fair weight for \"opencode\" must be 1-1000"
-        );
-        sc.dispatch.fair_weights.insert("opencode".into(), 2);
-        sc.dispatch.fair_weights.insert("bad name".into(), 1);
-        assert!(
-            validate(&sc).unwrap_err().contains("fair weight client"),
-            "weight keys share the label charset"
-        );
-        sc.dispatch.fair_weights.clear();
-        validate(&sc).unwrap();
     }
 
     #[test]
@@ -979,7 +701,7 @@ mod tests {
     #[test]
     fn stale_tmp_from_a_crashed_save_is_cleaned_up() {
         let dir = TestDir::new();
-        save(&dir.0, &claimed()).unwrap();
+        save(&dir.0, &store_with_key()).unwrap();
         fs::write(dir.0.join("config.json.tmp"), "half a save").unwrap();
         assert!(load(&dir.0).unwrap().is_some());
         assert!(!dir.0.join("config.json.tmp").exists());
@@ -989,26 +711,6 @@ mod tests {
     fn validate_rejects_bad_shapes() {
         type Mutation = Box<dyn Fn(&mut StoredConfig)>;
         let cases: Vec<(&str, Mutation)> = vec![
-            (
-                "dup user",
-                Box::new(|sc| sc.users.push(sc.users[0].clone())),
-            ),
-            (
-                "two superusers",
-                Box::new(|sc| {
-                    let mut u = sc.users[0].clone();
-                    u.username = "root2".into();
-                    sc.users.push(u);
-                }),
-            ),
-            (
-                "bad username",
-                Box::new(|sc| sc.users[0].username = "a b".into()),
-            ),
-            (
-                "empty hash",
-                Box::new(|sc| sc.users[0].password_hash.clear()),
-            ),
             ("rpm zero", Box::new(|sc| sc.upstream.nim_keys[0].rpm = 0)),
             (
                 "rpm huge",
@@ -1022,22 +724,10 @@ mod tests {
                 }),
             ),
             (
-                "dangling owner",
-                Box::new(|sc| sc.upstream.nim_keys[0].owner = "ghost".into()),
-            ),
-            (
-                "superuser without enabled key",
-                Box::new(|sc| sc.upstream.nim_keys[0].enabled = false),
-            ),
-            (
                 "heartbeat >= max_wait",
                 Box::new(|sc| sc.limits.heartbeat_secs = 900),
             ),
             ("zero inflight", Box::new(|sc| sc.limits.max_inflight = 0)),
-            (
-                "zero backpressure threshold",
-                Box::new(|sc| sc.limits.backpressure_queue_threshold_eta_secs = 0),
-            ),
             (
                 "bad base_url",
                 Box::new(|sc| sc.upstream.base_url = "ftp://x".into()),
@@ -1066,89 +756,28 @@ mod tests {
                 Box::new(|sc| sc.upstream.nim_keys[0].key = "   ".into()),
             ),
             (
-                "bad client key name",
-                Box::new(|sc| {
-                    sc.client_auth.keys.push(ClientKey {
-                        name: "a b".into(),
-                        secret_sha256: "a".repeat(64),
-                        last4: "aaaa".into(),
-                        owner: "root".into(),
-                    })
-                }),
-            ),
-            (
-                "duplicate client key name",
-                Box::new(|sc| {
-                    for _ in 0..2 {
-                        sc.client_auth.keys.push(ClientKey {
-                            name: "dup".into(),
-                            secret_sha256: "b".repeat(64),
-                            last4: "bbbb".into(),
-                            owner: "root".into(),
-                        });
-                    }
-                }),
-            ),
-            (
-                "client key dangling owner",
-                Box::new(|sc| {
-                    sc.client_auth.keys.push(ClientKey {
-                        name: "ck".into(),
-                        secret_sha256: "c".repeat(64),
-                        last4: "cccc".into(),
-                        owner: "ghost".into(),
-                    })
-                }),
+                "link-local base_url",
+                Box::new(|sc| sc.upstream.base_url = "http://169.254.169.254".into()),
             ),
         ];
         for (name, mutate) in cases {
-            let mut sc = claimed();
+            let mut sc = store_with_key();
             mutate(&mut sc);
             assert!(validate(&sc).is_err(), "{name} should be rejected");
         }
     }
 
     #[test]
-    fn validate_accepts_client_keys_and_rejects_bad_digests() {
-        let mut sc = claimed();
-        sc.client_auth.keys.push(ClientKey {
-            name: "opencode".into(),
-            secret_sha256: "a".repeat(64),
-            last4: "aaaa".into(),
-            owner: "root".into(),
-        });
-        validate(&sc).expect("well-formed client key");
-        sc.client_auth.keys[0].secret_sha256 = "nothex".into();
-        assert!(validate(&sc).is_err());
-    }
-
-    #[test]
-    fn recovery_store_with_orphan_keys_is_valid_until_claimed() {
-        // users hand-emptied on the volume: keys keep dangling owners and the
-        // store must still load so the wizard can reassign them.
-        let mut sc = claimed();
-        sc.users.clear();
-        validate(&sc).expect("recovery store loads");
-    }
-
-    #[test]
-    fn runtime_maps_mode_and_trims_base_url() {
-        let mut sc = claimed();
+    fn runtime_trims_base_url_and_maps_limits_governor() {
+        let mut sc = store_with_key();
         sc.upstream.base_url = "http://mock:9999/".into();
-        sc.client_auth.keys.push(ClientKey {
-            name: "opencode".into(),
-            secret_sha256: "b".repeat(64),
-            last4: "bbbb".into(),
-            owner: "root".into(),
-        });
+        sc.limits.strict_passthrough = true;
+        sc.governor.overrides.insert("m".into(), 7);
         let rt = sc.runtime();
         assert_eq!(rt.base_url, "http://mock:9999");
-        assert_eq!(
-            rt.clients.as_ref().unwrap().get(&"b".repeat(64)).unwrap(),
-            "opencode"
-        );
-        sc.client_auth.mode = Mode::Open;
-        assert!(sc.runtime().clients.is_none());
+        assert_eq!(rt.upstreams, vec!["http://mock:9999".to_owned()]);
+        assert!(rt.strict_passthrough);
+        assert_eq!(rt.governor.overrides.get("m"), Some(&7));
     }
 }
 

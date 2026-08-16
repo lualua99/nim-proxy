@@ -31,17 +31,18 @@ Each test launches the **real binary** (`CARGO_BIN_EXE_nim-proxy`) against an
 in-process mock NIM whose next responses are scripted per test
 (`Behavior::{RateLimited, ServerError, BadRequest, BadRequestIfInjected,
 Hang, Ok}`). Boot uses a **pre-written `config.json` in a tempdir `DATA_DIR`**
-(`start_proxy_with`, cleaned on drop) or drives the `/setup` wizard
-(`start_proxy_fresh` + `complete_setup`); `expect_refuses_to_start` covers a
-corrupt store, `version>1`, and an unwritable `DATA_DIR`. Covers: the setup
-posture (`/v1`→503, `/`→302 `/setup`) and wizard happy path, open vs keyed
-`/v1`, multi-user login / session cookie / scraper Bearer, role and ownership
-denials, the config-store round-trip and live pool rebuilds mid-run, per-model
-worker-exhaustion governing, 429 ride-out with key failover, Retry-After
-timing, verbatim error relay, fail-fast 504, pacing enforcement, conversation
-affinity (pin + spread), models cache single-hit, usage injection incl.
-rejection fallback and kill switch, stalled-stream cutoff, metrics accuracy
-(exact token counts), history persistence across restart, SIGTERM, and
+(`start_proxy_with`, cleaned on drop) or defaults when no store exists;
+`expect_refuses_to_start` covers a corrupt store, `version>1`, and an
+unwritable `DATA_DIR`. Since v0.7.0 the proxy is a single-operator local build
+(no auth): `/v1`, the dashboard, and `/metrics` are open, every request is
+labeled `local`, and `StoreOpts` writes NIM keys/limits directly (the users,
+wizard, and client-key fixtures are gone). Covers: the config-store
+round-trip and live pool rebuilds mid-run, per-model worker-exhaustion
+governing, 429 ride-out with key failover, Retry-After timing, verbatim error
+relay, fail-fast 504, pacing enforcement, conversation affinity (pin +
+spread), models cache single-hit, usage injection incl. rejection fallback and
+kill switch, stalled-stream cutoff, metrics accuracy (exact token counts),
+history persistence across restart, SIGTERM, the operator request queue, and
 dashboard/config routes.
 
 ## 3. Load — `scripts/loadtest.py` vs `scripts/mock_nim.py --enforce`
@@ -56,9 +57,10 @@ single client-visible failure or a single upstream rate violation.**
 
 ```sh
 python3 scripts/mock_nim.py --enforce --rpm 40 --worker-slots 32 --port 9999 &
-cargo run --release &     # boots into first-run setup (no app-level env vars)
-# complete the wizard at /setup — base URL http://127.0.0.1:9999, add the mock's
-# keys, set the API mode to open (or mint a client key for --proxy-keys)
+cargo run --release &     # single-operator build: no setup, no auth, /v1 open
+# write the store with the mock's keys (or pre-seed DATA_DIR/config.json)
+curl -X POST localhost:8000/api/settings/nim-keys \
+  -H 'content-type: application/json' -d '{"add":{"key":"k1","rpm":40}}'
 python3 scripts/loadtest.py --clients 100 --requests 3
 ```
 

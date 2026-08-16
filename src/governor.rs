@@ -62,17 +62,6 @@ pub struct Governor {
     models: Mutex<HashMap<String, ModelState>>,
 }
 
-/// Per-model state snapshot for the dashboard capacity-model endpoint.
-pub struct ModelView {
-    pub model: String,
-    /// Current concurrency cap (0 = ungoverned).
-    pub limit: usize,
-    /// Requests currently in flight upstream.
-    pub inflight: usize,
-    /// True if new admissions are temporarily blocked (post-exhaustion drain).
-    pub blocked: bool,
-}
-
 /// A held admission: the request is (about to be) in flight on this model.
 /// Dropping it releases the slot on every exit path.
 pub struct ModelPermit {
@@ -118,24 +107,6 @@ impl Governor {
             .iter()
             .filter(|(_, s)| s.limit > 0)
             .map(|(m, s)| (m.clone(), s.limit))
-            .collect()
-    }
-
-    /// Point-in-time per-model view for the capacity what-if simulator. Unlike
-    /// [`Governor::limits`], this includes ungoverned models (limit = 0) and
-    /// the current in-flight count, so the dashboard can show the live gate.
-    pub fn view(&self) -> Vec<ModelView> {
-        let now = Instant::now();
-        self.models
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(model, s)| ModelView {
-                model: model.clone(),
-                limit: s.limit,
-                inflight: s.inflight,
-                blocked: s.blocked_until.is_some_and(|b| b > now),
-            })
             .collect()
     }
 

@@ -33,12 +33,9 @@ tokio-stream = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
-# Auth: HMAC-signed session cookies + constant-time secret comparison.
-hmac = "0.12"
+# NIM-key fingerprint for the dashboard (8 hex chars of the key's SHA-256).
 sha2 = "0.10"
-subtle = "2"
 getrandom = "0.2"
-moka = { version = "0.12", features = ["sync"] }
 
 [dev-dependencies]
 axum = "0.8"
@@ -47,25 +44,14 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde_json = "1"
 bytes = "1"
 futures-util = "0.3"
-# The e2e harness hashes client secrets when writing store fixtures.
-sha2 = "0.10"
 
-# PBKDF2 password hashing runs 600k HMAC-SHA256 iterations. At opt-level 0
-# every dev-build login (and the e2e auth suite) would take multiple seconds
-# — the generic HMAC glue monomorphizes into this crate, so the hashing
-# chain's own opt level isn't enough. Level 1 keeps debuginfo and fast
-# builds while making hashing near release speed.
+# The dev profile tunes opt-level 1 so the settings-key fingerprint (SHA-256)
+# in e2e builds stays fast without slowing iteration builds.
 [profile.dev]
 opt-level = 1
 [profile.dev.package.sha2]
 opt-level = 3
-[profile.dev.package.hmac]
-opt-level = 3
 [profile.dev.package.digest]
-opt-level = 3
-[profile.dev.package.block-buffer]
-opt-level = 3
-[profile.dev.package.generic-array]
 opt-level = 3
 
 [profile.release]

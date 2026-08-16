@@ -406,7 +406,7 @@ body.on-settings .tright, body.on-settings #custom { display: none; }
   </div>
   <nav role="tablist">
     <button role="tab" data-tab="overview" aria-selected="true"><span class="nbar"></span><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 8.5L8 3l6 5.5M3.5 7.5V13h9V7.5"/></svg><span class="label">Overview</span></button>
-    <button role="tab" data-tab="queue" hidden><span class="nbar"></span><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4.5h6.5M2 8h12M2 11.5h6.5"/><circle cx="10.5" cy="4.5" r="1"/><circle cx="10.5" cy="11.5" r="1"/></svg><span class="label">Queue</span></button>
+    <button role="tab" data-tab="queue" aria-selected="false"><span class="nbar"></span><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4.5h6.5M2 8h12M2 11.5h6.5"/><circle cx="10.5" cy="4.5" r="1"/><circle cx="10.5" cy="11.5" r="1"/></svg><span class="label">Queue</span></button>
     <button role="tab" data-tab="catalog" aria-selected="false"><span class="nbar"></span><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="2.5" width="11" height="4" rx="1"/><rect x="2.5" y="9.5" width="11" height="4" rx="1"/><path d="M2.5 4.5h11M2.5 11.5h11"/></svg><span class="label">Catalog</span></button>
     <button role="tab" data-tab="models" aria-selected="false"><span class="nbar"></span><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 13V7M8 13V3M12 13V9"/></svg><span class="label">Models</span></button>
     <button role="tab" data-tab="clients" aria-selected="false"><span class="nbar"></span><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5l-2.5 3L4 11M12 5l2.5 3L12 11M9.5 3l-3 10"/></svg><span class="label">Clients</span></button>
@@ -687,14 +687,6 @@ body.on-settings .tright, body.on-settings #custom { display: none; }
       <h2>Per lane <span class="tag">Now</span><span class="note">click a column to sort</span></h2>
       <div id="table-lanes"></div>
     </div>
-    <div class="card">
-      <h2>Capacity what-if <span class="tag">Approx</span>
-        <span class="note">seed values are the last hour's observations — a trend estimate, not a promise</span></h2>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px">
-        <div id="whatif-controls" style="min-width:0"></div>
-        <div id="whatif-output" style="min-width:0"></div>
-      </div>
-    </div>
   </section>
 
   <section id="tab-settings" hidden>
@@ -706,7 +698,6 @@ body.on-settings .tright, body.on-settings #custom { display: none; }
   </main>
 </div>
 <div id="tooltip"></div>
-<div id="modal"><div class="box"><h3 style="margin:0 0 12px;font-size:15px;font-weight:600">One-time secret</h3><div id="modal-body"></div></div></div>
 
 <script>
 "use strict";
@@ -782,7 +773,7 @@ let nowRows = [];
 let mode = { kind: 'following', preset: 'default', paused: false, from: 0, to: 0 };
 let cfg = {
   lanes: 0, rpm: 40, rpms: [], capacity_rpm: 0, window_fill: 0, window_capacity: 0, per_lane: [], price_in: 0.5, price_out: 2.0,
-  started: Date.now()/1000, version: '', auth: false, default_window_days: 30,
+  started: Date.now()/1000, version: '', default_window_days: 30,
   retention_days: 30, slo_target_percent: 99.9,
   ramp_active: false, ramp_remaining_secs: 0, restored_lanes: 0, dropped_lanes: 0,
 };
@@ -1374,9 +1365,6 @@ function render() {
 
   /* ----- shared reliability / security counters ----- */
   const shed = windowed(s => sum(s.rows, 'nimproxy_shed_total'));
-  const backpressure = windowed(s => sum(s.rows, 'nimproxy_backpressure_total'));
-  const unauth = windowed(s => sum(s.rows, 'nimproxy_unauthorized_total'));
-  const logins = windowed(s => sum(s.rows, 'nimproxy_login_failures_total'));
   const bench429 = windowed(s => sum(s.rows, 'nimproxy_lane_benched_total', l => l.status === '429'));
   const benchOther = windowed(s => sum(s.rows, 'nimproxy_lane_benched_total', l => l.status !== '429'));
   const qwS = wsum('nimproxy_queue_wait_seconds_sum'), qwN = wsum('nimproxy_queue_wait_seconds_count');
@@ -1393,7 +1381,7 @@ function render() {
     reqPts, capacityPoints, curRpm, avgRpm, peakRpm, capacity, rpmNow, capRatio, capColor, wreq, wok, okRatio, okColor,
     windowFill, windowCapacity, per_lane: cfg.per_lane,
     cReq, cP, cC, clients, streamT, streamF, toolReqs, totStreamT, totStreamF, totGen, totToolReq, clientSaved,
-    shed, backpressure, unauth, logins, bench429, benchOther, qwS, qwN, upS, upN, statusG,
+    shed, bench429, benchOther, qwS, qwN, upS, upN, statusG,
   };
   (RENDERERS[activeTab] || renderOverview)(c);
 }
@@ -1404,12 +1392,11 @@ const clientChip = cl =>
 
 /* ===== overview ===== */
 function renderHealthPanel(el, c) {
-  const { capRatio, capColor, okRatio, okColor, wreq, wok, bench429, shed, unauth, logins, rows, windowFill, windowCapacity } = c;
+  const { capRatio, capColor, okRatio, okColor, wreq, wok, bench429, shed, rows, windowFill, windowCapacity } = c;
   const capPct = Math.round(capRatio * 100);
   const okPct = wreq ? Math.round(okRatio * 100) : 0;
   const capLabel = capRatio >= 0.9 ? 'crit' : capRatio >= 0.7 ? 'warn' : 'ok';
   const okLabel = okRatio < 0.9 ? 'crit' : okRatio < 0.99 ? 'warn' : 'ok';
-  const sul = shed + unauth + logins;
   const healthRow = (mark, label, v, tone) =>
     `<div class="health-row${tone ? ' ' + tone : ''}"><span class="hmark ${mark}"></span><span class="hm">${esc(label)}</span><span class="hv">${v}</span></div>`;
   const active = sum(rows, 'nimproxy_active_requests');
@@ -1429,13 +1416,13 @@ function renderHealthPanel(el, c) {
     healthRow('ok', 'Active now', fmt(active)) +
     healthRow('ok', 'Queued', fmt(queued)) +
     healthRow(bench429 > 0 ? 'warn' : 'ok', 'Rate-limit benches', fmt(bench429)) +
-    healthRow(sul > 0 ? 'crit' : 'ok', 'Shed · 401 · Logins', `${fmt(shed)} · ${fmt(unauth)} · ${fmt(logins)}`) +
+    healthRow(shed > 0 ? 'crit' : 'ok', 'Shed (overload 503)', fmt(shed)) +
     `</div>`;
 }
 
 function renderOverview(c) {
   const { windowLabel, saved, capRatio, capColor, okRatio, okColor, wreq, wok, allP, allC,
-    reqPts, savedAt, rows, shed, unauth, logins, bench429, curRpm,
+    reqPts, savedAt, rows, shed, bench429, curRpm,
     models, ctok, clients, cC, errRate, windowFill, windowCapacity } = c;
   const ctokPts = rateSeries(s => sum(s.rows, 'nimproxy_completion_tokens_total'));
   const okPts = samples.slice(1).map((s, i) => {
@@ -1670,7 +1657,7 @@ function renderClients(c) {
 /* ===== reliability (was Proxy) ===== */
 function renderReliability(c) {
   const { rows, windowLabel, reqPts, wreq, wok, okRatio, clients, cReq, cP, cC, clientSaved,
-    shed, backpressure, unauth, logins, bench429, benchOther, qwS, qwN, upS, upN, ttftS, ttftN, statusG,
+    shed, bench429, benchOther, qwS, qwN, upS, upN, ttftS, ttftN, statusG,
     totStreamT, totStreamF, totGen, totToolReq, wsum } = c;
 
   /* hero: availability vs SLO + error budget */
@@ -1828,11 +1815,8 @@ function renderReliability(c) {
     metricRow('Active now', fmt(act)) +
     metricRow('Queued', fmt(que)) +
     metricRow('Shed (overload 503)', fmt(shed), shed > 0 ? 'crit' : 'zero') +
-    metricRow('Backpressure (503)', fmt(backpressure), backpressure > 0 ? 'warn' : 'zero') +
     metricRow('Rate-limit benches (429)', fmt(bench429), bench429 > 0 ? 'warn' : 'zero') +
-    metricRow('Other benches (5xx)', fmt(benchOther), benchOther > 0 ? 'warn' : 'zero') +
-    metricRow('Unauthorized (401)', fmt(unauth), unauth > 0 ? 'crit' : 'zero') +
-    metricRow('Failed logins', fmt(logins), logins > 0 ? 'crit' : 'zero');
+    metricRow('Other benches (5xx)', fmt(benchOther), benchOther > 0 ? 'warn' : 'zero');
   const jsonMode = windowed(s => sum(s.rows, 'nimproxy_json_mode_total'));
   const tcModes = wgroups('nimproxy_tool_choice_total', 'mode');
   const tcStr = [...tcModes.entries()].sort((a, b) => b[1] - a[1]).map(([m, n]) => `${esc(m)} ${fmt(n)}`).join(', ') || '–';
@@ -1967,130 +1951,6 @@ function renderCapacity(c) {
   })), { defaultIdx: 1, maxH: 360, minW: 560, empty: 'No lanes configured' });
 }
 
-/* ===== capacity what-if simulator — pure front-end, no new dependencies ===== */
-let capModel = null;
-let whatif = { keys: 1, perKeyRpm: 40, offered: 40, modelCap: 0, serviceSecs: 1 };
-
-function simCapacity(p) {
-  const { keys, perKeyRpm, offered, modelCap, serviceSecs } = p;
-  const keyRpm = keys * perKeyRpm;
-  const modelRpm = modelCap > 0 ? modelCap * (60 / Math.max(0.1, serviceSecs)) : Infinity;
-  const capRpm = Math.min(keyRpm, modelRpm);
-  const throughput = Math.min(capRpm, offered);
-  const util = capRpm > 0 ? offered / capRpm : Infinity;
-  let bottleneck;
-  if (offered > capRpm) {
-    bottleneck = keyRpm <= modelRpm ? 'Key window' : 'Model gate';
-  } else {
-    bottleneck = 'Client request rate';
-  }
-  let avgDelay = 0, p95Delay = 0, saturated = false;
-  if (capRpm > 0 && offered > 0) {
-    if (util >= 1) { avgDelay = Infinity; p95Delay = Infinity; saturated = true; }
-    else {
-      const w = (util / (1 - util)) * serviceSecs;
-      avgDelay = w; p95Delay = w * 3;
-    }
-  }
-  return { keyRpm, modelRpm, capRpm, throughput, util, bottleneck, avgDelay, p95Delay, saturated };
-}
-
-const whatifRow = (label, content) =>
-  `<div style="margin-bottom:14px"><div class="slabel">${esc(label)}</div>${content}</div>`;
-
-function whatifSet(key, val) {
-  const n = parseFloat(val);
-  if (isFinite(n)) whatif[key] = n;
-  renderWhatIf();
-}
-
-function renderWhatIfControls() {
-  const w = whatif;
-  const slider = (key, min, max, step, unit) =>
-    `<div style="display:flex;align-items:center;gap:10px">
-       <input type="range" min="${min}" max="${max}" step="${step}" value="${w[key]}"
-         style="flex:1" oninput="whatifSet('${key}', this.value)">
-       <span style="font:600 13px var(--mono);color:var(--ink-1);min-width:80px;text-align:right">${fmt(w[key])}${unit}</span>
-     </div>`;
-  $('whatif-controls').innerHTML =
-    whatifRow('NIM keys', slider('keys', 1, 20, 1, '')) +
-    whatifRow('RPM per key', slider('perKeyRpm', 1, 200, 1, ' rpm')) +
-    whatifRow('Client request rate',
-      slider('offered', 1, 2000, 1, ' rpm') +
-      '<div style="font:400 10.5px var(--mono);color:var(--ink-4);margin-top:3px">total offered load from all clients</div>') +
-    whatifRow('Model concurrency gate',
-      slider('modelCap', 0, 64, 1, '') +
-      '<div style="font:400 10.5px var(--mono);color:var(--ink-4);margin-top:3px">0 = ungoverned (no gate)</div>') +
-    whatifRow('Service time / request',
-      slider('serviceSecs', 0.1, 300, 0.1, ' s') +
-      '<div style="font:400 10.5px var(--mono);color:var(--ink-4);margin-top:3px">average upstream generation duration</div>');
-}
-
-function renderWhatIf() {
-  const w = whatif;
-  const r = simCapacity(w);
-  const cur = capModel;
-  const curOffered = cur ? cur.per_client.observed_rpm : 0;
-  const curCap = cur ? cur.per_key.capacity_rpm : 0;
-  const curQ50 = cur ? cur.history_sample.queue_wait_p50 : null;
-  const curQ95 = cur ? cur.history_sample.queue_wait_p95 : null;
-  const utilColor = r.util >= 1 ? css('--red') : r.util >= 0.7 ? css('--amber') : css('--green');
-  const delayBody = r.saturated
-    ? '<div style="font:600 17px var(--mono);color:var(--red)">unbounded</div>'
-    : `<div style="font:600 17px var(--mono);color:var(--ink-1)">${secs(r.avgDelay)}</div>`;
-  const p95Body = r.saturated
-    ? '<div style="font:600 17px var(--mono);color:var(--red)">unbounded</div>'
-    : `<div style="font:600 17px var(--mono);color:var(--ink-1)">${secs(r.p95Delay)}</div>`;
-  const modelRpmTxt = r.modelRpm === Infinity ? '∞' : fmt(r.modelRpm);
-  $('whatif-output').innerHTML =
-    `<div style="display:flex;align-items:baseline;gap:10px">
-       <span class="hlabel">Projected throughput</span>
-       <span style="margin-left:auto;font-size:30px;font-weight:600;letter-spacing:-1px;color:${utilColor}">${fmt(r.throughput)}</span>
-       <span style="font:400 12px var(--mono);color:var(--ink-3)">rpm</span>
-     </div>
-     <div style="display:flex;justify-content:space-between;font:400 11px var(--mono);color:var(--ink-3)">
-       <span>offered ${fmt(w.offered)} rpm</span>
-       <span>capped at ${fmt(r.capRpm)} rpm</span>
-     </div>
-     <div style="position:relative;height:14px;background:var(--track);border-radius:6px;overflow:hidden;margin:10px 0 6px">
-       <div style="position:absolute;inset:0;width:${Math.min(100, r.util*100).toFixed(1)}%;background:${utilColor};border-radius:6px"></div>
-     </div>
-     <div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0">
-       <span class="tag">bottleneck: ${esc(r.bottleneck)}</span>
-       ${r.saturated ? '<span class="tag" style="background:var(--chip-bad);color:var(--red)">over capacity</span>' : ''}
-     </div>
-     <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px">
-       <div class="conbox"><div class="slabel">Expected avg queue wait</div>${delayBody}</div>
-       <div class="conbox"><div class="slabel">Expected P95 queue wait</div>${p95Body}</div>
-     </div>
-     <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--hairline);font:400 11.5px var(--mono);color:var(--ink-3)">
-       <div style="display:flex;justify-content:space-between"><span>Current observed load</span><b>${fmt(curOffered)} rpm</b></div>
-       <div style="display:flex;justify-content:space-between"><span>Current configured capacity</span><b>${fmt(curCap)} rpm</b></div>
-       <div style="display:flex;justify-content:space-between"><span>Current avg queue wait</span><b>${curQ50==null?'–':secs(curQ50)}</b></div>
-       <div style="display:flex;justify-content:space-between"><span>Bottleneck split</span><b>keys ${fmt(r.keyRpm)} · model ${modelRpmTxt} rpm</b></div>
-       <div style="margin-top:6px;font:400 10.5px var(--mono);color:var(--ink-4)">M/M/1 approximation · trend estimate, not a promise</div>
-     </div>`;
-}
-
-async function loadCapacityModel() {
-  try {
-    const j = await (await fetch('/api/dashboard/capacity-model')).json();
-    capModel = j;
-    const pk = j.per_key, pc = j.per_client, hs = j.history_sample;
-    whatif.keys = Math.max(1, pk.rpm.length || 1);
-    whatif.perKeyRpm = pk.effective_rpm.length
-      ? Math.round(pk.effective_rpm.reduce((a, b) => a + b, 0) / pk.effective_rpm.length)
-      : (pk.rpm[0] || 40);
-    whatif.offered = Math.max(1, Math.round(pc.observed_rpm || 0));
-    const limits = (j.per_model.caps || []).map(m => m.limit).filter(l => l > 0);
-    whatif.modelCap = limits.length ? Math.max(...limits) : 0;
-    whatif.serviceSecs = isFinite(hs.upstream_seconds_mean) && hs.upstream_seconds_mean > 0
-      ? hs.upstream_seconds_mean : 1;
-  } catch { capModel = null; }
-  renderWhatIfControls();
-  renderWhatIf();
-}
-
 /* ===== settings — config-driven, not metrics-driven: fetched from
    /api/config on tab entry and after every save (the server filters by role
    BEFORE serialization, so sections render purely from data presence). Only
@@ -2111,28 +1971,25 @@ async function loadSettings() {
     const j = await (await fetch('/api/config')).json();
     if (!j.nim_keys) throw 0;
     SET = j;
-  } catch { $('setbody').innerHTML = '<div class="empty">Could not load settings — reload to sign in again</div>'; return; }
+  } catch { $('setbody').innerHTML = '<div class="empty">Could not load settings — the /api/config endpoint failed.</div>'; return; }
   renderSettings();
 }
 
 const TRASH = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2.5 4h11M6.5 4V2.5h3V4M4 4l.8 9.5h6.4L12 4M6.5 7v4M9.5 7v4"/></svg>';
-const LOCK = '<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 015 0v2"/></svg>';
 const SICONS = {
   access: '<svg viewBox="0 0 16 16"><circle cx="11" cy="5" r="2.5"/><path d="M9.2 6.8L2.5 13.5M4.8 11.2l1.5 1.5"/></svg>',
   server: '<svg viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="4.5" rx="1.5"/><rect x="2" y="9" width="12" height="4.5" rx="1.5"/><path d="M4.6 4.75h.01M4.6 11.25h.01"/></svg>',
-  users: '<svg viewBox="0 0 16 16"><circle cx="6" cy="5.5" r="2.2"/><path d="M2 13.5c.5-2.4 2-3.6 4-3.6s3.5 1.2 4 3.6M10.4 3.6a2.2 2.2 0 010 3.8M11.8 10c1.3.5 2 1.6 2.3 3.5"/></svg>',
-  account: '<svg viewBox="0 0 16 16"><circle cx="8" cy="5" r="2.5"/><path d="M3 14c.6-2.8 2.4-4.2 5-4.2s4.4 1.4 5 4.2"/></svg>',
 };
 
 function renderSettings() {
-  const subs = [['access', 'Access & keys'], ['server', 'Server'], ['users', 'Users'], ['account', 'Account']]
-    .filter(([id]) => id === 'access' || id === 'account' || (id === 'server' ? !!SET.server : !!SET.users));
+  const subs = [['access', 'NIM keys'], ['server', 'Server']]
+    .filter(([id]) => id === 'access' || (id === 'server' ? !!SET.server : false));
   if (!subs.some(([id]) => id === setSub)) setSub = 'access';
   $('setnav').innerHTML = subs.map(([id, label]) =>
     `<button role="tab" data-sub="${id}" aria-selected="${id === setSub}"><span class="nbar"></span>${SICONS[id]}<span>${esc(label)}</span></button>`).join('');
   for (const b of $('setnav').querySelectorAll('button'))
     b.addEventListener('click', () => { setSub = b.dataset.sub; renderSettings(); });
-  ({ access: renderAccess, server: renderServer, users: renderUsers, account: renderAccount })[setSub]();
+  ({ access: renderAccess, server: renderServer })[setSub]();
 }
 
 /* live lane state for one key row (also patched in place by the 5s refresh) */
@@ -2156,50 +2013,24 @@ async function copyText(text, btn) {
   setTimeout(() => { btn.textContent = old; }, 1500);
 }
 
-/* show-once client-key secret: modal only closes on an explicit Done, so a
-   stray re-render can't eat the one chance to copy it */
-function showSecret(name, secret) {
-  $('modal-body').innerHTML =
-    `<p style="margin:0 0 12px;color:var(--ink-2);font-size:13px">Client key <b>${esc(name)}</b> is ready. Copy it now — <b style="color:var(--amber-lt)">you won't see this again.</b></p>
-    <div class="secretbox">${esc(secret)}</div>
-    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px">
-      <button class="pbtn" id="modal-copy">Copy key</button>
-      <button class="gbtn" id="modal-done">Done</button>
-    </div>`;
-  $('modal-copy').addEventListener('click', () => copyText(secret, $('modal-copy')));
-  $('modal-done').addEventListener('click', () => $('modal').classList.remove('show'));
-  $('modal').classList.add('show');
-}
-
 function renderAccess() {
-  const admin = !!SET.users;
-  const ownerChip = o => admin ? ` <span class="tag">${esc(o)}</span>` : '';
   const keyRows = SET.nim_keys.map((k, i) => {
     const st = keyState(k);
     return `<div class="krow${k.enabled ? '' : ' koff'}">
       <div style="min-width:0">
-        <div class="kmask">nvapi-••••${esc(k.last4)}${ownerChip(k.owner)}</div>
+        <div class="kmask">nvapi-••••${esc(k.last4)}</div>
         <div class="kmeta">fp ${esc(String(k.fingerprint).slice(0, 8))} · ${k.lane != null ? `lane ${+k.lane}` : k.enabled ? 'unassigned' : 'off'}</div>
       </div>
       <span class="${st.cls}" data-ksfp="${esc(k.fingerprint)}">${esc(st.text)}</span>
       <span class="rpmwrap"><input class="sin num" type="number" min="1" max="10000" value="${+k.rpm}" data-rpm="${i}"><span class="unitl">rpm</span></span>
       <button class="tog" role="switch" aria-checked="${!!k.enabled}" data-tog="${i}" title="${k.enabled ? 'Disable — its rate window stays warm' : 'Enable'}"></button>
-      ${k.guarded
-        ? `<span class="klock" title="The pool keeps at least one enabled superuser key — add or enable another key before removing this one">${LOCK}</span>`
-        : `<button class="dbtn icon" data-kdel="${i}" title="Remove key">${TRASH}</button>`}
+      <button class="dbtn icon" data-kdel="${i}" title="Remove key">${TRASH}</button>
     </div>`;
   }).join('');
-  const ckRows = SET.client_keys.map((ck, i) =>
-    `<div class="krow">
-      <span style="font-weight:600;flex:0 1 160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(ck.name)}">${esc(ck.name)}</span>
-      <span class="kmask" style="color:var(--ink-25);font-weight:500">npk_••••••••${esc(ck.last4)}</span>
-      ${admin ? `<span class="tag">${esc(ck.owner)}</span>` : ''}
-      <button class="dbtn" style="margin-left:auto" data-ckdel="${i}">Revoke</button>
-    </div>`).join('');
   $('setbody').innerHTML = `
     <div class="card mb">
-      <h2>${admin ? 'NIM keys' : 'My NIM keys'} <span class="note" id="pool-note">${esc(poolNote())}</span></h2>
-      <p class="shint">Keys you add join the shared pool as yours${admin ? '' : ' — only you and admins see they exist'}. Changes apply live: kept keys keep their rate windows, disabled keys re-enable warm.</p>
+      <h2>NIM keys <span class="note" id="pool-note">${esc(poolNote())}</span></h2>
+      <p class="shint">Keys you add join the shared pool. Changes apply live: kept keys keep their rate windows, disabled keys re-enable warm.</p>
       <div>${keyRows || '<div class="empty">No NIM keys yet — add one below</div>'}</div>
       <div class="addrow">
         <input id="nk-key" class="sin" style="flex:1;min-width:200px" type="password" placeholder="nvapi-… paste a new NIM key" autocomplete="off" spellcheck="false">
@@ -2209,26 +2040,13 @@ function renderAccess() {
       </div>
       <div class="serr" id="nk-err"></div>
     </div>
-    <div class="card mb">
-      <h2>${admin ? 'Client API keys' : 'My API keys'} <span class="note">bearer tokens your harnesses use</span></h2>
-      <div>${ckRows || '<div class="empty">No client keys yet</div>'}</div>
-      <div class="addrow">
-        <input id="ck-name" class="sin" style="flex:1;min-width:200px" placeholder="name this key, e.g. laptop-cli" maxlength="64" autocomplete="off" spellcheck="false">
-        <button class="pbtn" id="ck-add">+ Generate key</button>
-      </div>
-      <div class="serr" id="ck-err"></div>
-    </div>
     <div class="card">
       <h2>Connection</h2>
       <div class="congrid">
         <div class="conbox">
           <div class="slabel">Point your client's base URL at</div>
           <div style="display:flex;align-items:center;gap:10px"><span class="kmask" style="flex:1;overflow:hidden;text-overflow:ellipsis">${esc(location.origin + '/v1')}</span><button class="gbtn" id="copy-base">copy</button></div>
-        </div>
-        <div class="conbox">
-          <div class="slabel">API access mode</div>
-          <div class="kmask" style="color:${SET.mode === 'keyed' ? 'var(--green-lt)' : 'var(--amber-lt)'}">● ${SET.mode === 'keyed' ? 'Keyed — bearer required' : 'Open — no key needed'}</div>
-          <div class="kmeta" style="margin-top:4px">${SET.mode === 'keyed' ? 'harnesses authenticate with a client API key' : 'anyone who can reach /v1 can use the pool'}</div>
+          <div class="kmeta" style="margin-top:4px">no client key needed — /v1 is open to this host</div>
         </div>
       </div>
     </div>`;
@@ -2277,21 +2095,6 @@ function renderAccess() {
     if (!$('nk-key').value.trim()) return note('nk-err', 'Paste a NIM key first.');
     try { await addKey(); } catch (e) { note('nk-err', e.message); }
   });
-  for (const el of body.querySelectorAll('[data-ckdel]')) el.addEventListener('click', async () => {
-    const ck = SET.client_keys[+el.dataset.ckdel];
-    if (!confirm(`Revoke "${ck.name}"? Harnesses using it stop working immediately.`)) return;
-    try { await sPost('/api/settings/clients', { remove: ck.name }); await loadSettings(); }
-    catch (e) { note('ck-err', e.message); }
-  });
-  $('ck-add').addEventListener('click', async () => {
-    const name = $('ck-name').value.trim();
-    if (!name) return note('ck-err', 'Name the key first — e.g. laptop-cli.');
-    try {
-      const j = await sPost('/api/settings/clients', { add: { name } });
-      showSecret(name, j.secret);
-      await loadSettings();
-    } catch (e) { note('ck-err', e.message); }
-  });
   $('copy-base').addEventListener('click', () => copyText(location.origin + '/v1', $('copy-base')));
 }
 
@@ -2305,16 +2108,6 @@ function renderServer() {
     : new Date(+sv.history.available_from * 1000).toLocaleString();
   const historyBytes = new Intl.NumberFormat().format(+sv.history.file_bytes || 0);
   $('setbody').innerHTML = `
-    <div class="card mb">
-      <h2>API access mode
-        <span class="pills" style="margin-left:auto">
-          <button data-mode="open" aria-pressed="${SET.mode === 'open'}">Open</button>
-          <button data-mode="keyed" aria-pressed="${SET.mode === 'keyed'}">Keyed</button>
-        </span></h2>
-      <p class="shint">Controls <b>/v1</b> harness calls only. <b>Keyed</b> requires a bearer token; <b>Open</b> accepts anyone who can reach /v1 — trusted networks only.</p>
-      ${SET.mode === 'keyed' && !SET.client_keys.length ? '<p class="shint" style="color:var(--amber-lt)">Keyed mode with no client keys locks every harness out — generate one under Access &amp; keys.</p>' : ''}
-      <div class="serr" id="mode-err"></div>
-    </div>
     <div class="card mb">
       <h2>Upstream &amp; limits <button class="pbtn" id="save-limits" style="margin-left:auto">Save</button></h2>
       <div class="slabel">Upstream base URL · saving clears the model-catalog cache</div>
@@ -2336,11 +2129,6 @@ function renderServer() {
       <div style="display:flex;align-items:center;gap:10px;margin-top:16px">
         <button class="tog" role="switch" id="sv-strict" aria-checked="${!!L.strict_passthrough}"></button>
         <span style="font-size:12.5px">Strict passthrough <span class="kmeta" style="display:inline">— reject params the upstream doesn't accept</span></span>
-      </div>
-      <div style="display:flex;align-items:center;gap:10px;margin-top:12px">
-        <button class="tog" role="switch" id="sv-backpressure" aria-checked="${!!L.backpressure_enabled}"></button>
-        <span style="font-size:12.5px">Graduated backpressure <span class="kmeta" style="display:inline">— reject requests whose estimated queue wait exceeds the threshold</span></span>
-        <span class="rpmwrap" style="margin-left:auto"><input id="sv-bp-threshold" class="sin num" type="number" min="1" value="${+L.backpressure_queue_threshold_eta_secs}"><span class="unitl">s ETA bump</span></span>
       </div>
       <div class="serr" id="limits-err"></div>
     </div>
@@ -2375,24 +2163,8 @@ function renderServer() {
         <span class="pills" style="margin-left:auto">
           <button data-disppol="fifo" aria-pressed="${sv.dispatch.policy === 'fifo'}">FIFO</button>
           <button data-disppol="edf" aria-pressed="${sv.dispatch.policy === 'edf'}">EDF</button>
-          <button data-disppol="fair" aria-pressed="${sv.dispatch.policy === 'fair'}">Fair</button>
         </span></h2>
-      <p class="shint">How queued rate-limit slots are granted while the pool is saturated. <b>FIFO</b> — strict arrival order (the default). <b>EDF</b> — earliest deadline first; requests with an <span class="kmeta">X-Nim-Proxy-Deadline-Ms</span> header jump the line, everyone else is served in arrival order. <b>Fair</b> — per-client slot quotas with wait-aging, so one batch client can't starve interactive clients.</p>
-      <div class="limgrid" style="margin-top:10px">
-        <div><div class="slabel">Fair aging · waiters older than this are served first</div>
-          <span class="rpmwrap" style="display:flex"><input id="sv-fair-aging" class="sin" style="width:100%;text-align:right" type="number" min="1" step="1" value="${+sv.dispatch.fair_aging_secs}"><span class="unitl">s</span><button class="gbtn" id="sv-fair-aging-save" style="margin-left:8px">Save</button></span></div>
-      </div>
-      <div style="margin-top:12px">
-        <div class="slabel">Fair weight overrides · per client, served once per round</div>
-        <div id="disp-weights">${Object.entries(sv.dispatch.fair_weights || {}).map(([c, w]) =>
-          `<span class="ochip"><span title="${esc(c)}">${esc(c)}</span><b>×${+w}</b><button data-wdel="${esc(c)}" title="Remove weight">×</button></span>`).join('')
-          || '<span class="kmeta">no overrides — hash-derived weights (1–3)</span>'}</div>
-        <div class="addrow">
-          <input id="dw-client" class="sin" style="flex:1;min-width:160px" placeholder="client name, e.g. opencode" maxlength="64" autocomplete="off" spellcheck="false">
-          <span class="rpmwrap"><input id="dw-weight" class="sin num" type="number" min="1" max="1000" value="1"><span class="unitl">×/round</span></span>
-          <button class="gbtn" id="dw-add">+ weight</button>
-        </div>
-      </div>
+      <p class="shint">How queued rate-limit slots are granted while the pool is saturated. <b>FIFO</b> — strict arrival order (the default). <b>EDF</b> — earliest deadline first; requests with an <span class="kmeta">X-Nim-Proxy-Deadline-Ms</span> header jump the line, everyone else is served in arrival order.</p>
       <div class="serr" id="disp-err"></div>
     </div>
     <div class="card mb">
@@ -2419,38 +2191,18 @@ function renderServer() {
       </div>
       ${sv.history.compaction_pending ? '<p class="shint" style="color:var(--amber-lt)">compaction pending</p>' : ''}
       <div class="serr" id="history-err"></div>
-    </div>
-    <div class="card mb">
-      <h2>Response caching <button class="pbtn" id="save-cache" style="margin-left:auto">Save</button></h2>
-      <p class="shint">Serve repeat <b>non-streaming</b> requests (chat &amp; embeddings) from memory to skip the rate-limit queue and the upstream call, saving RPM budget. Keyed by model + path + request body. TTL 0 disables caching.</p>
-      <div class="limgrid" style="margin-top:10px">
-        <div><div class="slabel">TTL · 0 = off</div>
-          <span class="rpmwrap" style="display:flex"><input id="sv-cache-ttl" class="sin" style="width:100%;text-align:right" type="number" min="0" max="86400" step="1" value="${+sv.cache.ttl_secs}"><span class="unitl">s</span></span></div>
-        <div><div class="slabel">Max entries</div>
-          <span class="rpmwrap" style="display:flex"><input id="sv-cache-max" class="sin" style="width:100%;text-align:right" type="number" min="0" max="100000" step="1" value="${+sv.cache.max_entries}"><span class="unitl">entries</span></span></div>
-      </div>
-      <div class="serr" id="cache-err"></div>
     </div>`;
-  for (const b of $('setbody').querySelectorAll('[data-mode]')) b.addEventListener('click', async () => {
-    if (b.dataset.mode === SET.mode) return;
-    try { await sPost('/api/settings/clients', { mode: b.dataset.mode }); await loadSettings(); }
-    catch (e) { note('mode-err', e.message); }
-  });
-$('sv-strict').addEventListener('click', () => 
+  $('sv-strict').addEventListener('click', () => 
     $('sv-strict').setAttribute('aria-checked', $('sv-strict').getAttribute('aria-checked') !== 'true'));
-  $('sv-backpressure').addEventListener('click', () =>
-    $('sv-backpressure').setAttribute('aria-checked', $('sv-backpressure').getAttribute('aria-checked') !== 'true'));
   $('save-limits').addEventListener('click', async () => {
     const base = $('sv-base').value.trim();
     const upstreams = [...$('upstream-list').querySelectorAll('input[data-upidx]')].map(i => i.value.trim()).filter(Boolean);
     const nums = {
       max_wait_secs: 'sv-maxwait', heartbeat_secs: 'sv-heartbeat', models_ttl_secs: 'sv-ttl',
       stream_idle_secs: 'sv-idle', request_timeout_secs: 'sv-timeout', max_inflight: 'sv-inflight',
-      backpressure_queue_threshold_eta_secs: 'sv-bp-threshold',
     };
     const limits = {
       strict_passthrough: $('sv-strict').getAttribute('aria-checked') === 'true',
-      backpressure_enabled: $('sv-backpressure').getAttribute('aria-checked') === 'true',
     };
     for (const [field, id] of Object.entries(nums)) {
       const n = Math.round(+$(id).value);
@@ -2507,23 +2259,6 @@ $('sv-strict').addEventListener('click', () =>
     try { await sPost('/api/settings/dispatch', { policy: b.dataset.disppol }); await loadSettings(); }
     catch (e) { note('disp-err', e.message); }
   });
-  $('sv-fair-aging-save').addEventListener('click', async () => {
-    const a = Math.round(+$('sv-fair-aging').value);
-    if (!(a >= 1)) return note('disp-err', 'Fair aging needs a whole number ≥ 1 second.');
-    try { await sPost('/api/settings/dispatch', { fair_aging_secs: a }); await loadSettings(); }
-    catch (e) { note('disp-err', e.message); }
-  });
-  for (const b of $('setbody').querySelectorAll('[data-wdel]')) b.addEventListener('click', async () => {
-    try { await sPost('/api/settings/dispatch', { remove_weight: b.dataset.wdel }); await loadSettings(); }
-    catch (e) { note('disp-err', e.message); }
-  });
-  $('dw-add').addEventListener('click', async () => {
-    const client = $('dw-client').value.trim(), weight = Math.round(+$('dw-weight').value);
-    if (!client) return note('disp-err', 'Give the client name first.');
-    if (!(weight >= 1 && weight <= 1000)) return note('disp-err', 'Weight must be 1–1000.');
-    try { await sPost('/api/settings/dispatch', { set_weight: [client, weight] }); await loadSettings(); }
-    catch (e) { note('disp-err', e.message); }
-  });
   $('save-pricing').addEventListener('click', async () => {
     const pin = +$('sv-pin').value, pout = +$('sv-pout').value;
     if (!isFinite(pin) || !isFinite(pout)) return note('pricing-err', 'Prices need numeric values.');
@@ -2553,115 +2288,9 @@ $('sv-strict').addEventListener('click', () =>
       note('history-err', 'Saved.', true);
     } catch (e) { note('history-err', e.message); }
   });
-  $('save-cache').addEventListener('click', async () => {
-    const ttl = Math.round(+$('sv-cache-ttl').value);
-    const max = Math.round(+$('sv-cache-max').value);
-    if (!isFinite(ttl) || ttl < 0 || ttl > 86400)
-      return note('cache-err', 'TTL must be 0–86400 seconds (0 = off).');
-    if (!isFinite(max) || max < 0 || max > 100000)
-      return note('cache-err', 'Max entries must be 0–100000.');
-    try {
-      await sPost('/api/settings/cache', { ttl_secs: ttl, max_entries: max });
-      await loadSettings();
-      note('cache-err', 'Saved.', true);
-    } catch (e) { note('cache-err', e.message); }
-  });
 }
 
-function renderUsers() {
-  const RCLS = { superuser: 'superuser', admin: 'admin', user: 'user' };
-  const rows = SET.users.map((u, i) => `<div class="krow">
-    <span class="umono">${esc((u.username[0] || '?').toUpperCase())}</span>
-    <div style="min-width:0">
-      <div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(u.username)}</div>
-      <div class="kmeta">${+u.nim_keys} NIM · ${+u.client_keys} client</div>
-    </div>
-    <span class="rbadge ${RCLS[u.role] || 'user'}" style="margin-left:auto">${esc(String(u.role).toUpperCase())}</span>
-    ${u.role !== 'superuser' ? `<button class="gbtn" data-urp="${i}">Reset password</button>
-      <select class="sin" data-urole="${i}" title="Role">
-        <option value="admin"${u.role === 'admin' ? ' selected' : ''}>admin</option>
-        <option value="user"${u.role === 'user' ? ' selected' : ''}>user</option>
-      </select>
-      <button class="dbtn" data-udel="${i}">Delete</button>`
-      : `<span class="note" title="The superuser changes its own password in Account settings">self-managed</span>`}
-  </div>`).join('');
-  $('setbody').innerHTML = `<div class="card">
-    <h2>Users <span class="note">deleting a user pulls their NIM keys from the pool &amp; stops their harnesses</span></h2>
-    <div>${rows}</div>
-    <div class="addrow">
-      <input id="u-name" class="sin" style="flex:1;min-width:150px" placeholder="new username" autocomplete="off" spellcheck="false">
-      <input id="u-pass" class="sin" style="flex:1;min-width:150px" type="password" placeholder="initial password (10+ chars)" autocomplete="new-password">
-      <span class="pills"><button data-urolepick="user" aria-pressed="true">user</button><button data-urolepick="admin" aria-pressed="false">admin</button></span>
-      <button class="pbtn" id="u-add">Add user</button>
-    </div>
-    <div class="serr" id="u-err"></div>
-  </div>`;
-  const body = $('setbody');
-  for (const b of body.querySelectorAll('[data-urp]')) b.addEventListener('click', async () => {
-    const u = SET.users[+b.dataset.urp];
-    const pw = prompt(`New password for ${u.username} (at least 10 characters):`);
-    if (pw == null) return;
-    if (pw.length < 10) return note('u-err', 'Password must be at least 10 characters.');
-    try {
-      await sPost('/api/settings/users', { reset_password: { username: u.username, new_password: pw } });
-      note('u-err', `Password reset for ${u.username}.`, true);
-    } catch (e) { note('u-err', e.message); }
-  });
-  for (const s of body.querySelectorAll('[data-urole]')) s.addEventListener('change', async () => {
-    const u = SET.users[+s.dataset.urole];
-    try { await sPost('/api/settings/users', { set_role: { username: u.username, role: s.value } }); await loadSettings(); }
-    catch (e) { note('u-err', e.message); }
-  });
-  for (const b of body.querySelectorAll('[data-udel]')) b.addEventListener('click', async () => {
-    const u = SET.users[+b.dataset.udel];
-    if (!confirm(`Delete ${u.username}? Their NIM keys leave the pool and their API keys stop working.`)) return;
-    try { await sPost('/api/settings/users', { remove: u.username }); await loadSettings(); }
-    catch (e) { note('u-err', e.message); }
-  });
-  let newRole = 'user';
-  for (const b of body.querySelectorAll('[data-urolepick]')) b.addEventListener('click', () => {
-    newRole = b.dataset.urolepick;
-    for (const o of body.querySelectorAll('[data-urolepick]')) o.setAttribute('aria-pressed', o === b);
-  });
-  $('u-add').addEventListener('click', async () => {
-    const username = $('u-name').value.trim(), password = $('u-pass').value;
-    if (!username) return note('u-err', 'Pick a username.');
-    if (password.length < 10) return note('u-err', 'Initial password must be at least 10 characters.');
-    try { await sPost('/api/settings/users', { add: { username, password, role: newRole } }); await loadSettings(); }
-    catch (e) { note('u-err', e.message); }
-  });
-}
-
-function renderAccount() {
-  $('setbody').innerHTML = `<div class="card" style="max-width:560px">
-    <h2>Account</h2>
-    <div class="slabel">Username</div>
-    <input class="sin" style="width:100%" value="${esc(SET.username)}" disabled>
-    <div class="slabel" style="margin-top:14px">Current password</div>
-    <input id="a-cur" class="sin" style="width:100%" type="password" autocomplete="current-password">
-    <div class="slabel" style="margin-top:14px">New password · at least 10 characters</div>
-    <input id="a-new" class="sin" style="width:100%" type="password" autocomplete="new-password">
-    <div class="slabel" style="margin-top:14px">Confirm new password</div>
-    <input id="a-conf" class="sin" style="width:100%" type="password" autocomplete="new-password">
-    <p class="shint" style="margin-top:14px">Changing your password signs out your other sessions.</p>
-    <button class="pbtn" id="a-save">Update password</button>
-    <div class="serr" id="a-err"></div>
-  </div>`;
-  $('a-save').addEventListener('click', async () => {
-    const nw = $('a-new').value;
-    if (nw.length < 10) return note('a-err', 'New password must be at least 10 characters.');
-    if (nw !== $('a-conf').value) return note('a-err', 'Passwords do not match.');
-    $('a-save').disabled = true; // password hashing is deliberately slow
-    try {
-      await sPost('/api/settings/account', { current_password: $('a-cur').value, new_password: nw });
-      for (const id of ['a-cur', 'a-new', 'a-conf']) $(id).value = '';
-      note('a-err', 'Password updated — this session was refreshed.', true);
-    } catch (e) { note('a-err', e.message); }
-    $('a-save').disabled = false;
-  });
-}
-
-/* keep the lane-state chips honest while the page sits on Access & keys —
+/* keep the lane-state chips honest while the page sits on NIM keys —
    patch text in place so inputs and focus survive */
 setInterval(async () => {
   if (activeTab !== 'settings' || setSub !== 'access' || !SET) return;
@@ -2765,10 +2394,9 @@ setInterval(() => {
   if (activeTab === 'catalog' && !catBusy && Date.now() - catStamp > 60e3) loadCatalog(false);
 }, 15e3);
 
-/* ---------- request queue: in-flight requests + operator kill switch ----------
-   Admin-only (the sidebar button is hidden for other roles; the server 403s
-   regardless). Polls while the tab is visible; each row can be terminated,
-   which sends the client error code -91. */
+/* ---------- request queue: in-flight requests + local kill switch ----------
+   Open to the local operator. Polls while the tab is visible; each row can
+   be terminated, which sends the client error code -91. */
 let QUEUE = null, QUEUEERR = null, queueBusy = false, queueStamp = 0;
 
 function renderQueueTab() {
@@ -2800,9 +2428,7 @@ function renderQueueTab() {
   const pol = QUEUE.dispatch_policy || 'fifo';
   const polLabel = pol === 'edf'
     ? '<span class="rbadge admin" style="font-size:9px">EDF</span> earliest deadline first — X-Nim-Proxy-Deadline-Ms jump the line'
-    : pol === 'fair'
-      ? '<span class="rbadge admin" style="font-size:9px">Fair</span> per-client rounds + wait-aging — no starvation'
-      : '<span class="rbadge" style="font-size:9px">FIFO</span> strict arrival order';
+    : '<span class="rbadge" style="font-size:9px">FIFO</span> strict arrival order';
   $('q-policy').innerHTML = `<div class="hlabel">Slot scheduling</div>
     <div class="kmeta" style="display:flex;align-items:center;gap:6px;font-size:11px">${polLabel}</div>`;
   let pos = 0;
@@ -2858,14 +2484,13 @@ async function loadQueue(force) {
   queueBusy = true;
   try {
     const r = await fetch('/api/queue');
-    if (r.status === 403) throw Object.assign(new Error('This tab requires an admin session.'), { code: 403 });
     if (!r.ok) throw new Error(`queue endpoint returned ${r.status}`);
     QUEUE = await r.json();
     QUEUEERR = null;
     queueStamp = Date.now();
   } catch (e) {
     QUEUE = null;
-    QUEUEERR = e.code === 403 ? e.message : (e.message || String(e));
+    QUEUEERR = e.message || String(e);
   } finally {
     queueBusy = false;
     renderQueueTab();
@@ -2901,23 +2526,18 @@ function applyNowConfig(next) {
     capacity_rpm: +next.capacity_rpm || 0,
     window_fill: +next.window_fill || 0, window_capacity: +next.window_capacity || 0,
     per_lane: next.per_lane || [],
-    price_in: +next.price_in || 0, price_out: +next.price_out || 0, auth: !!next.auth,
+    price_in: +next.price_in || 0, price_out: +next.price_out || 0,
     default_window_days: +next.default_window_days || 30,
     retention_days: +next.retention_days || 0,
     slo_target_percent: +next.slo_target_percent || 99.9,
-    role: next.role || '',
     ramp_active: !!next.ramp_active,
     ramp_remaining_secs: +next.ramp_remaining_secs || 0,
     restored_lanes: +next.restored_lanes || 0,
     dropped_lanes: +next.dropped_lanes || 0,
   };
-  $('verinfo').textContent = `v${cfg.version} · ${cfg.lanes} lanes · auth ${cfg.auth ? 'on' : 'off'}`;
+  $('verinfo').textContent = `v${cfg.version} · ${cfg.lanes} lane${cfg.lanes === 1 ? '' : 's'}`;
   const defaultButton = document.querySelector('#ranges [data-range="default"]');
   if (defaultButton) defaultButton.textContent = `Default · ${cfg.default_window_days}d`;
-  // The request queue is admin-only: reveal its sidebar entry only for
-  // admins, and never for a session whose user was deleted (role unknown).
-  const qb = document.querySelector('#side nav button[data-tab="queue"]');
-  if (qb) qb.hidden = !(cfg.role === 'admin' || cfg.role === 'superuser');
 }
 
 function followingBounds() {
@@ -3138,7 +2758,6 @@ for (const b of document.querySelectorAll('#side nav button')) {
     if (activeTab === 'settings') loadSettings();
     if (activeTab === 'catalog') loadCatalog(false);
     if (activeTab === 'queue') loadQueue();
-    if (activeTab === 'capacity') loadCapacityModel();
     location.hash = activeTab;
     render();
   });

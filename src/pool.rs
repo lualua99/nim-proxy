@@ -508,59 +508,6 @@ impl Pool {
         Reservation::Wait(best_wait)
     }
 
-    /// Minimum wait until some lane can accept a request, without reserving.
-    /// Pure read — no side effects. Returns `Duration::ZERO` if a slot is
-    /// available right now, or the soonest a slot frees up across all lanes.
-    /// Used by the backpressure ETA gate.
-    pub fn min_wait(&self, prefer: Option<usize>) -> Duration {
-        let now = Instant::now();
-        let mut best = WINDOW;
-
-        if let Some(p) = prefer.filter(|&p| p < self.active) {
-            let lane = &self.lanes[p];
-            let cooldown = *lane.cooldown_until.lock().unwrap();
-            if cooldown > now {
-                best = best.min(cooldown - now);
-            }
-            let effective = if now < self.ramp_until {
-                self.ramp_budget(lane)
-            } else {
-                lane.calibration.lock().unwrap().effective_rpm(lane.rpm)
-            };
-            let sent = lane.sent.lock().unwrap();
-            if sent.len() >= effective && effective > 0 {
-                let window_ready = sent[sent.len() - effective] + WINDOW;
-                if window_ready > now {
-                    best = best.min(window_ready - now);
-                }
-            }
-        }
-
-        for lane in self.lanes[..self.active].iter() {
-            let cooldown = *lane.cooldown_until.lock().unwrap();
-            let effective = if now < self.ramp_until {
-                self.ramp_budget(lane)
-            } else {
-                lane.calibration.lock().unwrap().effective_rpm(lane.rpm)
-            };
-            let sent = lane.sent.lock().unwrap();
-            let window_ready = if sent.len() < effective {
-                now
-            } else if effective == 0 {
-                now + WINDOW
-            } else {
-                sent[sent.len() - effective] + WINDOW
-            };
-            let ready_at = window_ready.max(cooldown);
-            if ready_at <= now {
-                return Duration::ZERO;
-            }
-            best = best.min(ready_at - now);
-        }
-
-        best
-    }
-
     /// Return a reserved slot that was never spent on an upstream request
     /// (e.g. the client hung up while queued).
     pub fn release(&self, lane: usize, stamp: Instant) {

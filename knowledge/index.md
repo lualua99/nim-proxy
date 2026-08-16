@@ -26,19 +26,19 @@ the chronology in [log.md](log.md).
 | [reset-aware-dashboard-history](decisions/reset-aware-dashboard-history.md) | Generic startup index, explicit boot epochs, exact typed rollups, and one analytical window |
 | [distroless-scratch-image](decisions/distroless-scratch-image.md) | Static musl binary with baked-in TLS roots; FROM scratch, non-root, --health probe |
 | [usage-injection-auto-fallback](decisions/usage-injection-auto-fallback.md) | Inject stream_options for exact tokens; 400 → retry untouched and remember |
-| [auth-posture-and-dashboard-password](decisions/auth-posture-and-dashboard-password.md) | Fail closed without auth; API keys + a shared-password dashboard session |
+| [auth-posture-and-dashboard-password](decisions/auth-posture-and-dashboard-password.md) | Fail closed without auth; API keys + a shared-password dashboard session — v0.7.0 single-operator build has no auth plane |
 | [input-sanitizing-and-xss](decisions/input-sanitizing-and-xss.md) | Sanitize client `model`/`path` labels; escape + CSP the dashboard (XSS/cardinality/log-injection) |
 | [request-shape-metrics](decisions/request-shape-metrics.md) | Capture agent-behavior & quality signal as bounded metrics — counts, never content — for benchmarking |
 | [dashboard-operator-console-redesign](decisions/dashboard-operator-console-redesign.md) | 6→5 tabs (Compare merged in), dual light/dark theme (dark-only superseded), Inter via Google Fonts CDN under CSP, window-halves delta chips |
-| [ui-managed-config-store](decisions/ui-managed-config-store.md) | App config moves from env into a JSON store edited from the dashboard; first-run wizard, multi-user + per-key ownership, no encryption at rest |
+| [ui-managed-config-store](decisions/ui-managed-config-store.md) | App config moves from env into a JSON store edited from the dashboard; wizard/multi-user/ownership retired in v0.7.0 |
 | [explicit-request-deadline](decisions/explicit-request-deadline.md) | Opt-in wall-clock bound cancels queue/retry/generation work without weakening patient defaults |
 | [dependency-update-cooldown](decisions/dependency-update-cooldown.md) | Routine dependency updates wait seven days; security updates remain immediate |
+| [single-user-local-build](decisions/single-user-local-build.md) | v0.7.0 drops the multi-user/auth plane for a single-operator local build; /v1 and the dashboard are open, trust = bind address |
 | [dashboard-model-catalog](decisions/dashboard-model-catalog.md) | A Catalog sidebar tab surfaces the upstream model list via a session-gated /api/models sharing the proxy's TTL cache |
 | [request-queue-and-termination](decisions/request-queue-and-termination.md) | In-memory registry of live requests; admin Queue tab terminates any request with error code -91 |
 | [persist-rate-windows-across-restart](decisions/persist-rate-windows-across-restart.md) | Rate windows + governor caps survive restart via versioned JSONL; fresh restore arms a slow-start ramp |
 | [graduated-backpressure](decisions/graduated-backpressure.md) | Estimate queue wait; accept under threshold (ETA header), reject at or above it (503 + Retry-After). Deadline requests exempt |
 | [multi-upstream-failover](decisions/multi-upstream-failover.md) | Ordered upstream list with passive health detection; fail over when the primary goes down, back when it recovers, zero extra RPM |
-| [capacity-simulator](decisions/capacity-simulator.md) | Pure-front-end what-if simulator in the Capacity tab; M/M/1 closed-form delay, seeded from a `/api/dashboard/capacity-model` endpoint |
 | [realtime-dashboard-sse](decisions/realtime-dashboard-sse.md) | Dashboard swaps 3s polling for a server-sent-events stream (full snapshots, v1); poll kept as fallback, bounded connections |
 | [response-cache](decisions/response-cache.md) | Cache non-streaming idempotent requests (SHA256 key, moka) to skip the rate-limit queue and upstream call, saving RPM |
 
@@ -59,16 +59,16 @@ the chronology in [log.md](log.md).
 | [governor](architecture/governor.md) | Per-model concurrency gate; classifies worker exhaustion apart from 429s and backs off the model, adaptively |
 | [streaming-pipeline](architecture/streaming-pipeline.md) | Heartbeats, retry/failover, absolute deadlines, idle timeout, SSE usage scanning |
 | [metrics-history](architecture/metrics-history.md) | Prometheus registry + versioned JSONL, reset-aware startup index, exact rollups, and atomic retention |
-| [dashboard](architecture/dashboard.md) | Embedded operator console; one persisted window across 5 tabs plus clearly scoped Now values |
-| [client-auth](architecture/client-auth.md) | `/v1` client keys (open/keyed) + store-backed multi-user dashboard sessions; fail-closed posture |
+| [dashboard](architecture/dashboard.md) | Embedded operator console; one persisted window across 5 tabs plus clearly scoped Now values. v0.7.0: no session gate, auth tabs removed |
+| [client-auth](architecture/client-auth.md) | `/v1` client keys (open/keyed) + store-backed multi-user dashboard sessions; fail-closed posture — **retired in v0.7.0** |
 
 ## Operations — runbooks
 
 | Page | One-liner |
 |---|---|
 | [deploy-docker](ops/deploy-docker.md) | Compose, volume, healthcheck, hardening flags |
-| [configure-env](ops/configure-env.md) | Compose publishing, the 5 container env vars, Settings, and lockout recovery |
-| [sharing-with-friends](ops/sharing-with-friends.md) | Create-a-user multi-user setup, key etiquette, ToS positioning |
+| [configure-env](ops/configure-env.md) | Compose publishing, the container env vars, Settings, and the open-to-the-network posture |
+| [sharing-with-friends](ops/sharing-with-friends.md) | Create-a-user multi-user setup, key etiquette, ToS positioning — **retired in v0.7.0** |
 | [capacity-math](ops/capacity-math.md) | What N clients on K keys actually does (the 50-clients/3-lanes analysis) |
 
 ## Testing

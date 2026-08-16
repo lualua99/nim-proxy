@@ -1,18 +1,43 @@
-//! Setup & settings handlers — the config store's only writers. Every write
-//! runs the same pipeline under the store mutex: build candidate → validate
-//! → persist → swap the runtime snapshot → side effects. A failed disk write
-//! applies nothing; concurrent saves serialize on the mutex.
+//! Settings handlers — the config store's only writers. Every write runs the
+//! same pipeline under the store mutex: build candidate → validate → persist
+//! → swap the runtime snapshot → side effects. A failed disk write applies
+//! nothing; concurrent saves serialize on the mutex.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
-use crate::config::{self, NimKey, Role, StoredConfig, User};
-use crate::{auth, AppState};
+use crate::config::{self, DispatchPolicy, NimKey, StoredConfig};
+use crate::AppState;
+
+/// SHA-256 hex of a string — the stable identifier for stored NIM keys (the
+/// value itself is never sent back to a browser).
+fn sha256_hex(s: &str) -> String {
+    let d = Sha256::digest(s.as_bytes());
+    let mut out = String::with_capacity(2 * d.len());
+    for b in d {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// First 8 hex chars of SHA-256(key): the stable public identifier for a
+/// stored NIM key.
+fn fingerprint(key: &str) -> String {
+    sha256_hex(key)[..8].to_owned()
+}
+
+fn last4(s: &str) -> String {
+    s.chars()
+        .skip(s.chars().count().saturating_sub(4))
+        .collect()
+}
 
 /// Commit a candidate store: validate, persist, swap the runtime config and
 /// pool (with rate-state carryover), retune history retention, and only then
@@ -52,12 +77,6 @@ pub fn commit(
             .clone()
             .reconfigure_retention(candidate.history.days, crate::unix_now());
     }
-    if candidate.cache.ttl_secs != guard.cache.ttl_secs
-        || candidate.cache.max_entries != guard.cache.max_entries
-    {
-        let mut rc = state.response_cache.clone();
-        rc.reconfigure(candidate.cache.ttl_secs, candidate.cache.max_entries);
-    }
     *guard = candidate;
     state.config_revision.fetch_add(1, Ordering::SeqCst);
     Ok(())
@@ -70,240 +89,6 @@ fn json_error(status: StatusCode, code: &str, message: impl Into<String>) -> Res
     (status, axum::Json(body)).into_response()
 }
 
-fn not_found() -> Response {
-    StatusCode::NOT_FOUND.into_response()
-}
-
-/// `GET /setup` — the first-run wizard (404 once setup is complete).
-pub async fn setup_page(State(state): State<Arc<AppState>>) -> Response {
-    if !state.setup_required.load(Ordering::SeqCst) {
-        return not_found();
-    }
-    (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        include_str!("setup.html"),
-    )
-        .into_response()
-}
-
-#[derive(Deserialize)]
-pub struct SetupReq {
-    username: String,
-    password: String,
-    #[serde(default)]
-    base_url: Option<String>,
-    #[serde(default)]
-    nim_keys: Vec<SetupKey>,
-    /// Mint a first client key with the claim (the wizard sends this by
-    /// default) so a fresh keyed-mode proxy can serve /v1 immediately.
-    #[serde(default)]
-    create_client_key: Option<CreateClientKey>,
-}
-
-#[derive(Deserialize)]
-pub struct CreateClientKey {
-    name: String,
-}
-
-#[derive(Deserialize)]
-pub struct SetupKey {
-    key: String,
-    rpm: Option<usize>,
-}
-
-/// `POST /setup` — one atomic claim: create the superuser, record the
-/// initial NIM keys, persist, and mint a session. No half-configured server
-/// state exists at any point; an abandoned wizard leaves nothing behind.
-pub async fn setup_submit(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    axum::Json(req): axum::Json<SetupReq>,
-) -> Response {
-    if !state.setup_required.load(Ordering::SeqCst) {
-        return not_found();
-    }
-    if req.password.len() < 10 {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "weak_password",
-            "password must be at least 10 characters",
-        );
-    }
-    let password = req.password.clone();
-    let hash = tokio::task::spawn_blocking(move || auth::hash_password(&password))
-        .await
-        .expect("hashing task");
-
-    let mut minted: Option<(String, String)> = None; // (name, secret)
-    let result = {
-        let mut guard = state.store.lock().unwrap();
-        if guard.superuser().is_some() {
-            // Two claimers raced; the store lock made the first win whole.
-            return json_error(
-                StatusCode::CONFLICT,
-                "already_configured",
-                "setup was just completed by someone else",
-            );
-        }
-        let mut cand = guard.clone();
-        cand.users = vec![User {
-            username: req.username.clone(),
-            password_hash: hash.clone(),
-            role: Role::Superuser,
-        }];
-        // Lockout recovery: keys already in the store belonged to hand-deleted
-        // users; the new superuser adopts any orphans, restoring both the
-        // ownership rule and the pool-floor invariant.
-        for k in &mut cand.upstream.nim_keys {
-            if k.owner != req.username {
-                k.owner.clone_from(&req.username);
-            }
-        }
-        for c in &mut cand.client_auth.keys {
-            if c.owner != req.username {
-                c.owner.clone_from(&req.username);
-            }
-        }
-        if let Some(b) = &req.base_url {
-            cand.upstream.base_url = b.trim().trim_end_matches('/').to_owned();
-        }
-        for k in &req.nim_keys {
-            cand.upstream.nim_keys.push(NimKey {
-                key: k.key.trim().to_owned(),
-                owner: req.username.clone(),
-                enabled: true,
-                rpm: k.rpm.unwrap_or(40),
-            });
-        }
-        if let Some(ck) = &req.create_client_key {
-            let secret = mint_client_secret();
-            cand.client_auth.keys.push(ClientKey {
-                name: ck.name.trim().to_owned(),
-                secret_sha256: auth::sha256_hex(&secret),
-                last4: last4(&secret),
-                owner: req.username.clone(),
-            });
-            minted = Some((ck.name.trim().to_owned(), secret));
-        }
-        commit(&state, &mut guard, cand)
-    };
-    match result {
-        Ok(()) => {
-            state.setup_required.store(false, Ordering::SeqCst);
-            tracing::info!(user = %req.username, "first-time setup complete; superuser created");
-            let cookie = auth::mint_session_cookie(&state, &headers, &req.username, &hash);
-            let mut body = serde_json::json!({"ok": true});
-            if let Some((name, secret)) = minted {
-                // The one and only time this secret leaves the server.
-                body["client_key"] = serde_json::json!({"name": name, "secret": secret});
-            }
-            (
-                StatusCode::OK,
-                [(header::SET_COOKIE, cookie)],
-                axum::Json(body),
-            )
-                .into_response()
-        }
-        Err(e) => json_error(StatusCode::BAD_REQUEST, "invalid_config", e),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct ValidateKeyReq {
-    key: String,
-    #[serde(default)]
-    base_url: Option<String>,
-}
-
-/// `POST /setup/validate-key` — pre-auth key probe for the wizard, bounded
-/// by the shared login throttle plus a fixed delay (probe abuse control).
-pub async fn setup_validate_key(
-    State(state): State<Arc<AppState>>,
-    axum::Json(req): axum::Json<ValidateKeyReq>,
-) -> Response {
-    if !state.setup_required.load(Ordering::SeqCst) {
-        return not_found();
-    }
-    if state.admin.is_throttled() {
-        return json_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "throttled",
-            "too many validation attempts, try again shortly",
-        );
-    }
-    state.admin.note_failure(); // every pre-auth probe burns throttle budget
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let base = req
-        .base_url
-        .clone()
-        .unwrap_or_else(|| state.store.lock().unwrap().upstream.base_url.clone());
-    let base = base.trim().trim_end_matches('/').to_owned();
-    // The wizard's advanced path lets an unauthenticated pre-claim caller
-    // supply base_url, so guard it against the link-local metadata range
-    // before probing (loopback/RFC1918 stay allowed for self-hosted NIM).
-    if let Err(e) = config::check_base_url(&base) {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_base_url", e);
-    }
-    axum::Json(match probe_key(&state.http, &base, req.key.trim()).await {
-        Ok(models) => serde_json::json!({"ok": true, "models": models}),
-        Err(e) => serde_json::json!({"ok": false, "error": e}),
-    })
-    .into_response()
-}
-
-/// Probe a NIM key against an upstream: does `/v1/models` answer for it?
-/// Bypasses the pool and the models cache — this is an explicit-key check.
-pub async fn probe_key(http: &reqwest::Client, base_url: &str, key: &str) -> Result<usize, String> {
-    match crate::proxy::fetch_models(http, base_url, key).await {
-        Ok(resp) if resp.status().is_success() => {
-            let body = resp
-                .bytes()
-                .await
-                .map_err(|e| format!("upstream sent an unreadable model list: {e}"))?;
-            let v: serde_json::Value = serde_json::from_slice(&body)
-                .map_err(|e| format!("upstream sent an unreadable model list: {e}"))?;
-            Ok(v["data"].as_array().map(|a| a.len()).unwrap_or(0))
-        }
-        Ok(resp) => Err(format!("upstream rejected the key ({})", resp.status())),
-        Err(e) => Err(format!("cannot reach upstream: {e}")),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Authenticated settings API. Every handler runs the same shape: resolve the
-// caller's role from the live store, check authorization, build a candidate,
-// and push it through `commit` (validate → persist → swap → side effects).
-// ---------------------------------------------------------------------------
-
-use axum::Extension;
-
-use crate::auth::Identity;
-use crate::config::{ClientKey, DispatchPolicy, Mode};
-
-/// First 8 hex chars of SHA-256(key): the stable public identifier for a
-/// stored NIM key (the value itself is never sent back to a browser).
-fn fingerprint(key: &str) -> String {
-    auth::sha256_hex(key)[..8].to_owned()
-}
-
-/// A fresh client-key secret: `npk_` + 128 bits of OS randomness. Only the
-/// SHA-256 digest is ever stored; the caller shows the secret exactly once.
-fn mint_client_secret() -> String {
-    let mut raw = [0u8; 16];
-    getrandom::getrandom(&mut raw).expect("OS RNG for client secret");
-    format!("npk_{}", auth::hex(&raw))
-}
-
-fn last4(s: &str) -> String {
-    s.chars()
-        .skip(s.chars().count().saturating_sub(4))
-        .collect()
-}
-
-fn forbidden(msg: &str) -> Response {
-    json_error(StatusCode::FORBIDDEN, "forbidden", msg)
-}
-
 fn bad_request(msg: impl Into<String>) -> Response {
     json_error(StatusCode::BAD_REQUEST, "invalid_config", msg)
 }
@@ -312,32 +97,10 @@ fn ok_json(v: serde_json::Value) -> Response {
     axum::Json(v).into_response()
 }
 
-/// The caller's role, or None if their user was deleted mid-session
-/// (answered with [`stale_session`]).
-fn role_of(sc: &StoredConfig, username: &str) -> Option<Role> {
-    sc.user(username).map(|u| u.role)
-}
-
-fn stale_session() -> Response {
-    json_error(
-        StatusCode::UNAUTHORIZED,
-        "unauthorized",
-        "your user no longer exists",
-    )
-}
-
-/// `GET /api/config` — the Settings page's data source, filtered by role
-/// BEFORE serialization: a user-role response simply contains no server
-/// settings and no other users' key rows, so DOM tampering reveals nothing.
-pub async fn api_config(
-    State(state): State<Arc<AppState>>,
-    Extension(Identity(username)): Extension<Identity>,
-) -> Response {
+/// `GET /api/config` — the Settings page's data source: the full server
+/// configuration plus live lane state for the stored NIM keys.
+pub async fn api_config(State(state): State<Arc<AppState>>) -> Response {
     let sc = state.store.lock().unwrap().clone();
-    let Some(role) = role_of(&sc, &username) else {
-        return stale_session();
-    };
-    let admin_view = role.is_admin();
 
     // Live lane state, keyed by the key string (enabled keys only).
     let pool = state.pool();
@@ -353,64 +116,34 @@ pub async fn api_config(
         })
         .collect();
 
-    // The padlocked key: the superuser's only enabled key (the pool floor).
-    let su = sc
-        .superuser()
-        .map(|u| u.username.clone())
-        .unwrap_or_default();
-    let su_enabled: Vec<&str> = sc
-        .upstream
-        .nim_keys
-        .iter()
-        .filter(|k| k.enabled && k.owner == su)
-        .map(|k| k.key.as_str())
-        .collect();
-    let guarded_key = (su_enabled.len() == 1).then(|| su_enabled[0].to_owned());
-
     let nim_keys: Vec<serde_json::Value> = sc
         .upstream
         .nim_keys
         .iter()
-        .filter(|k| admin_view || k.owner == username)
         .map(|k| {
             let lane = stats.get(&k.key);
             serde_json::json!({
                 "fingerprint": fingerprint(&k.key),
                 "last4": last4(&k.key),
-                "owner": k.owner,
                 "enabled": k.enabled,
                 "rpm": k.rpm,
                 "lane": lane.map(|(i, _, _, _)| i),
                 "in_window": lane.map(|(_, w, _, _)| w),
                 "cooldown_ms": lane.map(|(_, _, c, _)| c),
                 "cal_factor": lane.map(|(_, _, _, f)| f),
-                "guarded": guarded_key.as_deref() == Some(k.key.as_str()),
             })
         })
         .collect();
 
-    let client_keys: Vec<serde_json::Value> = sc
-        .client_auth
-        .keys
-        .iter()
-        .filter(|c| admin_view || c.owner == username)
-        .map(|c| serde_json::json!({"name": c.name, "last4": c.last4, "owner": c.owner}))
-        .collect();
-
-    let mut body = serde_json::json!({
-        "username": username,
-        "role": match role { Role::Superuser => "superuser", Role::Admin => "admin", Role::User => "user" },
-        "mode": match sc.client_auth.mode { Mode::Open => "open", Mode::Keyed => "keyed" },
+    let history = state.history.status();
+    let body = serde_json::json!({
+        "mode": "open",
         "pool": {
             "enabled": pool.len(),
             "capacity_rpm": pool.capacity_rpm(),
         },
         "nim_keys": nim_keys,
-        "client_keys": client_keys,
-    });
-    if admin_view {
-        let history = state.history.status();
-        body["server"] = serde_json::json!({
+        "server": {
             "base_url": sc.upstream.base_url,
             "upstreams": sc.upstream.upstreams,
             "limits": sc.limits,
@@ -425,21 +158,8 @@ pub async fn api_config(
             "governor": sc.governor,
             "recovery": sc.recovery,
             "dispatch": sc.dispatch,
-            "cache": sc.cache,
-        });
-        body["users"] = serde_json::json!(sc
-            .users
-            .iter()
-            .map(|u| {
-                serde_json::json!({
-                    "username": u.username,
-                    "role": match u.role { Role::Superuser => "superuser", Role::Admin => "admin", Role::User => "user" },
-                    "nim_keys": sc.upstream.nim_keys.iter().filter(|k| k.owner == u.username).count(),
-                    "client_keys": sc.client_auth.keys.iter().filter(|c| c.owner == u.username).count(),
-                })
-            })
-            .collect::<Vec<_>>());
-    }
+        },
+    });
     ok_json(body)
 }
 
@@ -463,24 +183,18 @@ pub struct SetNimKey {
     rpm: Option<usize>,
 }
 
-/// `POST /api/settings/nim-keys` — any role may add keys (owner = caller)
-/// and manage their OWN keys; admins manage any key. The superuser's last
-/// enabled key is protected by `validate` (the pool-floor invariant).
+/// `POST /api/settings/nim-keys` — add/remove/configure the NIM keys that
+/// make up the shared pool. The local operator manages the whole set.
 pub async fn nim_keys(
     State(state): State<Arc<AppState>>,
-    Extension(Identity(username)): Extension<Identity>,
     axum::Json(req): axum::Json<NimKeysReq>,
 ) -> Response {
     let mut guard = state.store.lock().unwrap();
-    let Some(role) = role_of(&guard, &username) else {
-        return stale_session();
-    };
     let mut cand = guard.clone();
     match (req.add, req.remove, req.set) {
         (Some(add), None, None) => {
             cand.upstream.nim_keys.push(NimKey {
                 key: add.key.trim().to_owned(),
-                owner: username,
                 enabled: true,
                 rpm: add.rpm.unwrap_or(40),
             });
@@ -494,9 +208,6 @@ pub async fn nim_keys(
             else {
                 return bad_request("no such key");
             };
-            if !role.is_admin() && cand.upstream.nim_keys[pos].owner != username {
-                return forbidden("you can only remove your own keys");
-            }
             cand.upstream.nim_keys.remove(pos);
         }
         (None, None, Some(set)) => {
@@ -508,9 +219,6 @@ pub async fn nim_keys(
             else {
                 return bad_request("no such key");
             };
-            if !role.is_admin() && k.owner != username {
-                return forbidden("you can only change your own keys");
-            }
             if let Some(e) = set.enabled {
                 k.enabled = e;
             }
@@ -526,88 +234,15 @@ pub async fn nim_keys(
     }
 }
 
-#[derive(Deserialize)]
-pub struct ClientsReq {
-    add: Option<AddClient>,
-    remove: Option<String>, // name
-    mode: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct AddClient {
-    name: String,
-}
-
-/// `POST /api/settings/clients` — client-key create/revoke for any role
-/// (own keys; admins revoke any); the open/keyed mode toggle is admin-only.
-/// A created secret is returned exactly once and stored only as a digest.
-pub async fn clients(
-    State(state): State<Arc<AppState>>,
-    Extension(Identity(username)): Extension<Identity>,
-    axum::Json(req): axum::Json<ClientsReq>,
-) -> Response {
-    let mut guard = state.store.lock().unwrap();
-    let Some(role) = role_of(&guard, &username) else {
-        return stale_session();
-    };
-    let mut cand = guard.clone();
-    let mut minted: Option<String> = None;
-    match (req.add, req.remove, req.mode) {
-        (Some(add), None, None) => {
-            let secret = mint_client_secret();
-            cand.client_auth.keys.push(ClientKey {
-                name: add.name.trim().to_owned(),
-                secret_sha256: auth::sha256_hex(&secret),
-                last4: last4(&secret),
-                owner: username,
-            });
-            minted = Some(secret);
-        }
-        (None, Some(name), None) => {
-            let Some(pos) = cand.client_auth.keys.iter().position(|c| c.name == name) else {
-                return bad_request("no such client key");
-            };
-            if !role.is_admin() && cand.client_auth.keys[pos].owner != username {
-                return forbidden("you can only revoke your own client keys");
-            }
-            cand.client_auth.keys.remove(pos);
-        }
-        (None, None, Some(mode)) => {
-            if !role.is_admin() {
-                return forbidden("changing the API access mode requires an admin");
-            }
-            cand.client_auth.mode = match mode.as_str() {
-                "open" => Mode::Open,
-                "keyed" => Mode::Keyed,
-                _ => return bad_request("mode must be \"open\" or \"keyed\""),
-            };
-        }
-        _ => return bad_request("send exactly one of add / remove / mode"),
-    }
-    match commit(&state, &mut guard, cand) {
-        Ok(()) => ok_json(match minted {
-            Some(secret) => serde_json::json!({"ok": true, "secret": secret}),
-            None => serde_json::json!({"ok": true}),
-        }),
-        Err(e) => bad_request(e),
-    }
-}
-
-/// Admin-only settings sections share one skeleton: role check, mutate the
-/// candidate, commit.
+/// Settings sections that own one flat config struct share one skeleton:
+/// mutate the candidate store and commit (validate → persist → swap).
 macro_rules! admin_section {
     ($fn_name:ident, $req:ty, $apply:expr) => {
         pub async fn $fn_name(
             State(state): State<Arc<AppState>>,
-            Extension(Identity(username)): Extension<Identity>,
             axum::Json(req): axum::Json<$req>,
         ) -> Response {
             let mut guard = state.store.lock().unwrap();
-            match role_of(&guard, &username) {
-                Some(r) if r.is_admin() => {}
-                Some(_) => return forbidden("server settings require an admin"),
-                None => return stale_session(),
-            }
             let mut cand = guard.clone();
             #[allow(clippy::redundant_closure_call)]
             ($apply)(&mut cand, req);
@@ -626,22 +261,16 @@ pub struct UpstreamReq {
     upstreams: Vec<String>,
 }
 
-/// `POST /api/settings/upstream` (admin) — set the base URL and the
-/// ordered upstream endpoint list. An empty list means single-endpoint
-/// mode (backward compatible). Also flushes the model-catalog cache and
-/// the per-model no-inject memory, which are upstream-specific.
+/// `POST /api/settings/upstream` — set the base URL and the ordered upstream
+/// endpoint list. An empty list means single-endpoint mode. Also flushes the
+/// model-catalog cache and the per-model no-inject memory, which are
+/// upstream-specific.
 pub async fn upstream(
     State(state): State<Arc<AppState>>,
-    Extension(Identity(username)): Extension<Identity>,
     axum::Json(req): axum::Json<UpstreamReq>,
 ) -> Response {
     let result = {
         let mut guard = state.store.lock().unwrap();
-        match role_of(&guard, &username) {
-            Some(r) if r.is_admin() => {}
-            Some(_) => return forbidden("server settings require an admin"),
-            None => return stale_session(),
-        }
         let mut cand = guard.clone();
         cand.upstream.base_url = req.base_url.trim().trim_end_matches('/').to_owned();
         cand.upstream.upstreams = req
@@ -672,8 +301,6 @@ pub struct LimitsReq {
     request_timeout_secs: u64,
     max_inflight: usize,
     strict_passthrough: bool,
-    backpressure_enabled: bool,
-    backpressure_queue_threshold_eta_secs: u64,
 }
 
 admin_section!(
@@ -688,8 +315,6 @@ admin_section!(
             request_timeout_secs: req.request_timeout_secs,
             max_inflight: req.max_inflight,
             strict_passthrough: req.strict_passthrough,
-            backpressure_enabled: req.backpressure_enabled,
-            backpressure_queue_threshold_eta_secs: req.backpressure_queue_threshold_eta_secs,
         };
     }
 );
@@ -742,21 +367,6 @@ admin_section!(
 );
 
 #[derive(Deserialize)]
-pub struct CacheReq {
-    ttl_secs: u64,
-    max_entries: u64,
-}
-
-admin_section!(
-    cache_cfg,
-    CacheReq,
-    |cand: &mut StoredConfig, req: CacheReq| {
-        cand.cache.ttl_secs = req.ttl_secs;
-        cand.cache.max_entries = req.max_entries;
-    }
-);
-
-#[derive(Deserialize)]
 pub struct GovernorReq {
     enabled: Option<bool>,
     set_override: Option<GovernorOverride>,
@@ -785,47 +395,25 @@ admin_section!(
     }
 );
 
-/// Slot-scheduling settings: which policy (fifo/edf/fair), the fair-mode
-/// anti-starvation bound, and per-client fair-mode weight overrides.
+/// Slot-scheduling settings: which policy (fifo/edf).
 #[derive(Deserialize)]
 pub struct DispatchReq {
     policy: Option<String>,
-    fair_aging_secs: Option<u64>,
-    set_weight: Option<(String, usize)>,
-    remove_weight: Option<String>,
 }
 
-/// `POST /api/settings/dispatch` (admin) — swap slot scheduling live. Only
-/// the given fields change; `policy` and `fair_aging_secs` map 1:1 to the
-/// store, weights are edited per client.
+/// `POST /api/settings/dispatch` — swap slot scheduling live.
 pub async fn dispatch_cfg(
     State(state): State<Arc<AppState>>,
-    Extension(Identity(username)): Extension<Identity>,
     axum::Json(req): axum::Json<DispatchReq>,
 ) -> Response {
     let mut guard = state.store.lock().unwrap();
-    match role_of(&guard, &username) {
-        Some(r) if r.is_admin() => {}
-        Some(_) => return forbidden("server settings require an admin"),
-        None => return stale_session(),
-    }
     let mut cand = guard.clone();
     if let Some(p) = req.policy {
         cand.dispatch.policy = match p.as_str() {
             "fifo" => DispatchPolicy::Fifo,
             "edf" => DispatchPolicy::Edf,
-            "fair" => DispatchPolicy::Fair,
-            _ => return bad_request("policy must be \"fifo\", \"edf\" or \"fair\""),
+            _ => return bad_request("policy must be \"fifo\" or \"edf\""),
         };
-    }
-    if let Some(a) = req.fair_aging_secs {
-        cand.dispatch.fair_aging_secs = a;
-    }
-    if let Some((client, weight)) = req.set_weight {
-        cand.dispatch.fair_weights.insert(client, weight);
-    }
-    if let Some(client) = req.remove_weight {
-        cand.dispatch.fair_weights.remove(&client);
     }
     match commit(&state, &mut guard, cand) {
         Ok(()) => ok_json(serde_json::json!({"ok": true})),
@@ -834,274 +422,15 @@ pub async fn dispatch_cfg(
 }
 
 #[derive(Deserialize)]
-pub struct UsersReq {
-    add: Option<AddUser>,
-    remove: Option<String>,
-    reset_password: Option<ResetPassword>,
-    set_role: Option<SetRole>,
+pub struct ValidateKeyReq {
+    key: String,
 }
 
-#[derive(Deserialize)]
-pub struct AddUser {
-    username: String,
-    password: String,
-    role: String,
-}
-
-#[derive(Deserialize)]
-pub struct ResetPassword {
-    username: String,
-    new_password: String,
-}
-
-#[derive(Deserialize)]
-pub struct SetRole {
-    username: String,
-    role: String,
-}
-
-fn parse_role(s: &str) -> Option<Role> {
-    match s {
-        "admin" => Some(Role::Admin),
-        "user" => Some(Role::User),
-        _ => None, // superuser is never assignable
-    }
-}
-
-/// `POST /api/settings/users` (admin) — create/delete users, reset
-/// passwords, change roles. Deleting a user pulls their NIM keys from the
-/// pool and revokes their client keys — their harnesses stop; that's the
-/// point. The superuser can never be deleted or demoted.
-pub async fn users(
-    State(state): State<Arc<AppState>>,
-    Extension(Identity(username)): Extension<Identity>,
-    axum::Json(req): axum::Json<UsersReq>,
-) -> Response {
-    // Hash outside the store lock (PBKDF2 is deliberately slow).
-    let new_hash = match (&req.add, &req.reset_password) {
-        (Some(a), None) => {
-            if a.password.len() < 10 {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "weak_password",
-                    "password must be at least 10 characters",
-                );
-            }
-            let p = a.password.clone();
-            Some(
-                tokio::task::spawn_blocking(move || auth::hash_password(&p))
-                    .await
-                    .expect("hashing task"),
-            )
-        }
-        (None, Some(r)) => {
-            if r.new_password.len() < 10 {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "weak_password",
-                    "password must be at least 10 characters",
-                );
-            }
-            let p = r.new_password.clone();
-            Some(
-                tokio::task::spawn_blocking(move || auth::hash_password(&p))
-                    .await
-                    .expect("hashing task"),
-            )
-        }
-        _ => None,
-    };
-
-    let mut guard = state.store.lock().unwrap();
-    match role_of(&guard, &username) {
-        Some(r) if r.is_admin() => {}
-        Some(_) => return forbidden("user management requires an admin"),
-        None => return stale_session(),
-    }
-    let mut cand = guard.clone();
-    match (req.add, req.remove, req.reset_password, req.set_role) {
-        (Some(add), None, None, None) => {
-            let Some(role) = parse_role(&add.role) else {
-                return bad_request("role must be \"admin\" or \"user\"");
-            };
-            cand.users.push(User {
-                username: add.username.trim().to_owned(),
-                password_hash: new_hash.expect("hashed above"),
-                role,
-            });
-        }
-        (None, Some(target), None, None) => {
-            let Some(user) = cand.user(&target) else {
-                return bad_request("no such user");
-            };
-            if user.role == Role::Superuser {
-                return forbidden("the superuser can never be deleted");
-            }
-            cand.users.retain(|u| u.username != target);
-            cand.upstream.nim_keys.retain(|k| k.owner != target);
-            cand.client_auth.keys.retain(|c| c.owner != target);
-        }
-        (None, None, Some(reset), None) => {
-            let Some(user) = cand.users.iter_mut().find(|u| u.username == reset.username) else {
-                return bad_request("no such user");
-            };
-            // The superuser is inviolable: an admin resetting it would be
-            // account takeover + lockout (the change invalidates the real
-            // owner's sessions). The superuser rotates its own password via
-            // /account (current-password re-auth); a forgotten one is the
-            // documented volume-edit recovery.
-            if user.role == Role::Superuser {
-                return forbidden("the superuser's password can only be changed by the superuser (Account settings)");
-            }
-            user.password_hash = new_hash.expect("hashed above");
-        }
-        (None, None, None, Some(set)) => {
-            let Some(role) = parse_role(&set.role) else {
-                return bad_request("role must be \"admin\" or \"user\"");
-            };
-            let Some(user) = cand.users.iter_mut().find(|u| u.username == set.username) else {
-                return bad_request("no such user");
-            };
-            if user.role == Role::Superuser {
-                return forbidden("the superuser's role is immutable");
-            }
-            user.role = role;
-        }
-        _ => return bad_request("send exactly one of add / remove / reset_password / set_role"),
-    }
-    match commit(&state, &mut guard, cand) {
-        Ok(()) => {
-            // Header-credential memo may hold a deleted/reset user.
-            state.admin.clear_scraper_memo();
-            ok_json(serde_json::json!({"ok": true}))
-        }
-        Err(e) => bad_request(e),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct AccountReq {
-    current_password: String,
-    new_password: String,
-}
-
-/// Why an own-password change could not be applied to the candidate store.
-#[derive(Debug, PartialEq)]
-enum PasswordChangeErr {
-    UserGone,
-    HashRotated,
-}
-
-/// Apply an own-password change, refusing unless the stored hash is still
-/// the one the caller's current password was verified against. The verify
-/// runs outside the store lock (PBKDF2 is deliberately slow), so a hash
-/// rotation — an admin reset landing in that window — must win, not be
-/// silently overwritten by a change authorized against the old password.
-fn apply_password_change(
-    cand: &mut StoredConfig,
-    username: &str,
-    verified_hash: &str,
-    new_hash: &str,
-) -> Result<(), PasswordChangeErr> {
-    let Some(user) = cand.users.iter_mut().find(|u| u.username == username) else {
-        return Err(PasswordChangeErr::UserGone);
-    };
-    if user.password_hash != verified_hash {
-        return Err(PasswordChangeErr::HashRotated);
-    }
-    user.password_hash = new_hash.to_owned();
-    Ok(())
-}
-
-/// `POST /api/settings/account` — own password change; always re-verifies
-/// the current password regardless of the session. Existing sessions die
-/// (the cookie binds a password-hash fragment); the response carries a fresh
-/// cookie so THIS session survives.
-pub async fn account(
-    State(state): State<Arc<AppState>>,
-    Extension(Identity(username)): Extension<Identity>,
-    headers: HeaderMap,
-    axum::Json(req): axum::Json<AccountReq>,
-) -> Response {
-    if req.new_password.len() < 10 {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "weak_password",
-            "password must be at least 10 characters",
-        );
-    }
-    let stored_hash = {
-        let guard = state.store.lock().unwrap();
-        match guard.user(&username) {
-            Some(u) => u.password_hash.clone(),
-            None => {
-                return json_error(
-                    StatusCode::UNAUTHORIZED,
-                    "unauthorized",
-                    "your user no longer exists",
-                )
-            }
-        }
-    };
-    let current = req.current_password.clone();
-    let verify_hash = stored_hash.clone();
-    let ok = tokio::task::spawn_blocking(move || auth::verify_password(&current, &verify_hash))
-        .await
-        .expect("verify task");
-    if !ok {
-        return json_error(
-            StatusCode::FORBIDDEN,
-            "wrong_password",
-            "current password is incorrect",
-        );
-    }
-    let new = req.new_password.clone();
-    let new_hash = tokio::task::spawn_blocking(move || auth::hash_password(&new))
-        .await
-        .expect("hashing task");
-    let result = {
-        let mut guard = state.store.lock().unwrap();
-        let mut cand = guard.clone();
-        match apply_password_change(&mut cand, &username, &stored_hash, &new_hash) {
-            Ok(()) => {}
-            Err(PasswordChangeErr::UserGone) => {
-                return json_error(
-                    StatusCode::UNAUTHORIZED,
-                    "unauthorized",
-                    "your user no longer exists",
-                )
-            }
-            Err(PasswordChangeErr::HashRotated) => {
-                return json_error(
-                    StatusCode::CONFLICT,
-                    "password_changed",
-                    "your password was changed while this request was in flight; log in again",
-                )
-            }
-        }
-        commit(&state, &mut guard, cand)
-    };
-    match result {
-        Ok(()) => {
-            state.admin.clear_scraper_memo();
-            let cookie = auth::mint_session_cookie(&state, &headers, &username, &new_hash);
-            (
-                StatusCode::OK,
-                [(header::SET_COOKIE, cookie)],
-                axum::Json(serde_json::json!({"ok": true})),
-            )
-                .into_response()
-        }
-        Err(e) => bad_request(e),
-    }
-}
-
-/// `POST /api/settings/validate-key` — authenticated twin of the setup
-/// probe. The upstream is ALWAYS the configured `base_url`, never a
-/// caller-supplied one: a request-supplied target would let any logged-in
-/// user turn the proxy into an SSRF probe of internal hosts (the response
-/// distinguishes reachable/rejected/unreachable). An admin testing a new
-/// upstream saves it first, then validates. `req.base_url` is ignored.
+/// `POST /api/settings/validate-key` — probe a NIM key against the configured
+/// upstream: does `/v1/models` answer for it? Probes the configured
+/// `base_url`, never a caller-supplied one (a request-supplied target would
+/// turn the proxy into an SSRF probe of internal hosts). Bypasses the pool
+/// and the models cache — this is an explicit-key check.
 pub async fn validate_key(
     State(state): State<Arc<AppState>>,
     axum::Json(req): axum::Json<ValidateKeyReq>,
@@ -1115,58 +444,20 @@ pub async fn validate_key(
     .into_response()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn store_with_user(username: &str, hash: &str) -> StoredConfig {
-        let mut sc = StoredConfig::default();
-        sc.users.push(User {
-            username: username.into(),
-            password_hash: hash.into(),
-            role: Role::User,
-        });
-        sc
-    }
-
-    #[test]
-    fn parse_role_maps_admin_and_user_but_never_superuser() {
-        assert_eq!(parse_role("admin"), Some(Role::Admin));
-        assert_eq!(parse_role("user"), Some(Role::User));
-        // Superuser is intentionally NOT assignable through the users API.
-        assert_eq!(parse_role("superuser"), None);
-        assert_eq!(parse_role("root"), None);
-        assert_eq!(parse_role(""), None);
-    }
-
-    #[test]
-    fn password_change_applies_when_the_verified_hash_is_current() {
-        let mut sc = store_with_user("alice", "old-hash");
-        assert_eq!(
-            apply_password_change(&mut sc, "alice", "old-hash", "new-hash"),
-            Ok(())
-        );
-        assert_eq!(sc.users[0].password_hash, "new-hash");
-    }
-
-    #[test]
-    fn password_change_refuses_when_the_hash_rotated_since_verify() {
-        // An admin reset landed between this caller's verify and commit: the
-        // stored hash is no longer the one the current password matched.
-        let mut sc = store_with_user("alice", "reset-by-admin");
-        assert_eq!(
-            apply_password_change(&mut sc, "alice", "old-hash", "new-hash"),
-            Err(PasswordChangeErr::HashRotated)
-        );
-        assert_eq!(sc.users[0].password_hash, "reset-by-admin", "unchanged");
-    }
-
-    #[test]
-    fn password_change_refuses_when_the_user_was_deleted() {
-        let mut sc = StoredConfig::default();
-        assert_eq!(
-            apply_password_change(&mut sc, "ghost", "h", "n"),
-            Err(PasswordChangeErr::UserGone)
-        );
+/// Probe a NIM key against an upstream: does `/v1/models` answer for it?
+/// Bypasses the pool and the models cache — this is an explicit-key check.
+pub async fn probe_key(http: &reqwest::Client, base_url: &str, key: &str) -> Result<usize, String> {
+    match crate::proxy::fetch_models(http, base_url, key).await {
+        Ok(resp) if resp.status().is_success() => {
+            let body = resp
+                .bytes()
+                .await
+                .map_err(|e| format!("upstream sent an unreadable model list: {e}"))?;
+            let v: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|e| format!("upstream sent an unreadable model list: {e}"))?;
+            Ok(v["data"].as_array().map(|a| a.len()).unwrap_or(0))
+        }
+        Ok(resp) => Err(format!("upstream rejected the key ({})", resp.status())),
+        Err(e) => Err(format!("cannot reach upstream: {e}")),
     }
 }

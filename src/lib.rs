@@ -1,5 +1,3 @@
-mod auth;
-mod cache;
 mod config;
 mod dispatch;
 mod governor;
@@ -21,12 +19,12 @@ pub use config::fuzz as fuzz_config;
 #[doc(hidden)]
 pub use proxy::fuzz as fuzz_proxy;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use axum::extract::{DefaultBodyLimit, Extension, State};
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -38,8 +36,6 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::convert::Infallible;
 use tokio::sync::Mutex;
 
-use auth::{Admin, Identity};
-use config::Role;
 use dispatch::Dispatcher;
 use pool::{Pool, PoolHandle};
 
@@ -64,22 +60,10 @@ pub struct Config {
     /// Reference $/1M token prices for the dashboard's "dollars saved" figure.
     pub price_in: f64,
     pub price_out: f64,
-    /// token -> client name. None = local mode, no client auth.
-    pub clients: Option<HashMap<String, String>>,
     /// Cap on concurrent requests; bounds memory under floods.
     pub max_inflight: usize,
     /// Model-pressure governor settings (worker concurrency, not RPM).
     pub governor: GovernorSettings,
-    /// When true, reject requests whose estimated queue wait exceeds the
-    /// threshold with 503 + Retry-After instead of letting them queue.
-    pub backpressure_enabled: bool,
-    /// ETA threshold in seconds: requests that would wait this long or longer
-    /// are rejected under backpressure (ignored when backpressure is off).
-    pub backpressure_queue_threshold_eta: Duration,
-    /// Response cache TTL in seconds; 0 disables caching.
-    pub response_cache_ttl_secs: u64,
-    /// Maximum number of entries in the response cache.
-    pub response_cache_max_entries: u64,
 }
 
 pub struct GovernorSettings {
@@ -107,9 +91,6 @@ pub struct AppState {
     pub store: std::sync::Mutex<config::StoredConfig>,
     /// Where the store lives (DATA_DIR).
     pub data_dir: std::path::PathBuf,
-    /// True until a superuser exists: the wizard is open, everything else
-    /// is closed (dashboard redirects to /setup, /v1 answers 503).
-    pub setup_required: std::sync::atomic::AtomicBool,
     /// Current key pool; the dispatcher reads it per grant, settings swap it.
     pub pool: PoolHandle,
     /// Runtime upstream health/selection state (see `upstream`). Cheap,
@@ -122,8 +103,6 @@ pub struct AppState {
     pub no_inject: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Distinct sanitized model labels seen (bounds metric cardinality).
     pub model_labels: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// Session + throttle machinery for the operator surface.
-    pub admin: Admin,
     /// Requests currently in flight; capped to bound memory under floods.
     pub inflight: AtomicUsize,
     /// Per-model worker-concurrency gate (runtime state, settings in Config).
@@ -149,8 +128,6 @@ pub struct AppState {
     pub started: u64,
     /// Live SSE dashboard-stream connections; bounds memory under many tabs.
     pub sse_connections: AtomicUsize,
-    /// Response cache for idempotent non-streaming requests.
-    pub response_cache: cache::ResponseCache,
 }
 
 impl AppState {
@@ -178,9 +155,6 @@ fn warn_legacy_env() {
         "NIM_API_KEYS",
         "NIM_BASE_URL",
         "RPM_PER_KEY",
-        "PROXY_API_KEYS",
-        "ADMIN_PASSWORD",
-        "INSECURE_NO_AUTH",
         "MAX_WAIT_SECS",
         "HEARTBEAT_SECS",
         "MODELS_TTL_SECS",
@@ -285,20 +259,16 @@ async fn api_dashboard(
     .into_response()
 }
 
-fn dashboard_now_payload(state: &AppState, username: &str) -> serde_json::Value {
+fn dashboard_now_payload(state: &AppState) -> serde_json::Value {
     let stored = state.store.lock().unwrap();
     let config_revision = state
         .config_revision
         .load(std::sync::atomic::Ordering::SeqCst);
     let pool = state.pool();
     let now = unix_now();
-    let current = state.history.current(now, || state.prometheus.render());
+    let exposition = state.prometheus.render();
+    let current = state.history.current(now, &exposition);
     let history_revision = current.tail.base_history_revision;
-    let role = stored.user(username).map(|u| match u.role {
-        Role::Superuser => "superuser",
-        Role::Admin => "admin",
-        Role::User => "user",
-    });
     let upstream_health: Vec<serde_json::Value> = state
         .upstream_selector
         .lock()
@@ -336,10 +306,8 @@ fn dashboard_now_payload(state: &AppState, username: &str) -> serde_json::Value 
         "version": env!("CARGO_PKG_VERSION"),
         "sampled_at": now,
         "started": state.started,
-        "role": role.unwrap_or_default(),
         "price_in": stored.pricing.ref_price_in,
         "price_out": stored.pricing.ref_price_out,
-        "auth": stored.client_auth.mode == config::Mode::Keyed,
         "lanes": pool.len(),
         "rpms": pool.rpms(),
         "capacity_rpm": pool.capacity_rpm(),
@@ -366,17 +334,11 @@ fn dashboard_now_payload(state: &AppState, username: &str) -> serde_json::Value 
     })
 }
 
-async fn api_dashboard_now(
-    State(state): State<Arc<AppState>>,
-    Extension(Identity(username)): Extension<Identity>,
-) -> axum::Json<serde_json::Value> {
-    axum::Json(dashboard_now_payload(&state, &username))
+async fn api_dashboard_now(State(state): State<Arc<AppState>>) -> axum::Json<serde_json::Value> {
+    axum::Json(dashboard_now_payload(&state))
 }
 
-async fn api_dashboard_stream(
-    State(state): State<Arc<AppState>>,
-    Extension(Identity(username)): Extension<Identity>,
-) -> Response {
+async fn api_dashboard_stream(State(state): State<Arc<AppState>>) -> Response {
     let current = state
         .sse_connections
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -392,13 +354,12 @@ async fn api_dashboard_stream(
     }
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(4);
     let state = state.clone();
-    let username = username.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(3));
         interval.tick().await;
         loop {
             interval.tick().await;
-            let value = dashboard_now_payload(&state, &username);
+            let value = dashboard_now_payload(&state);
             let data = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned());
             if tx.send(Ok(Event::default().data(data))).await.is_err() {
                 break;
@@ -418,197 +379,6 @@ async fn api_dashboard_stream(
         .into_response()
 }
 
-/// Chronicle window for the capacity-model's "recent observation": the last
-/// hour of history aggregates the per-key/per-client/per-model signal the
-/// what-if simulator seeds from. Short enough to reflect current behavior,
-/// long enough that a 5-minute sample interval yields a stable mean.
-const CAPACITY_MODEL_WINDOW: u64 = 3600;
-
-fn sum_metric(totals: &[history::MetricValue], metric: &str) -> f64 {
-    totals
-        .iter()
-        .filter(|m| m.metric == metric)
-        .map(|m| m.value)
-        .sum()
-}
-
-/// Quantile (0..1) of a histogram's cumulative `_bucket` deltas over a window,
-/// via linear interpolation — the backend twin of the dashboard's `quantile()`.
-fn quantile_from_totals(totals: &[history::MetricValue], base: &str, q: f64) -> Option<f64> {
-    let mut buckets: Vec<(f64, f64)> = totals
-        .iter()
-        .filter(|m| m.metric == format!("{base}_bucket"))
-        .map(|m| {
-            let le = m.labels.get("le").map(String::as_str).unwrap_or("+Inf");
-            let le = if le == "+Inf" {
-                f64::INFINITY
-            } else {
-                le.parse().unwrap_or(f64::INFINITY)
-            };
-            (le, m.value)
-        })
-        .collect();
-    buckets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    let total = buckets.last().map(|b| b.1).unwrap_or(0.0);
-    if total <= 0.0 {
-        return None;
-    }
-    let target = total * q;
-    let mut prev_le: f64 = 0.0;
-    let mut prev_count: f64 = 0.0;
-    for (le, count) in buckets {
-        if count >= target {
-            let hi = if le.is_infinite() {
-                prev_le.max(1.0)
-            } else {
-                le
-            };
-            return Some(
-                prev_le + (hi - prev_le) * (target - prev_count) / (count - prev_count).max(1.0),
-            );
-        }
-        prev_le = le;
-        prev_count = count;
-    }
-    None
-}
-
-/// Seed data for the Capacity tab's what-if simulator: purely aggregate
-/// observations from the existing registry/metrics/history — no request
-/// content, no new stored fields. Session-gated like every dashboard read
-/// (any user may view Capacity, matching the tab's existing permission line).
-async fn api_capacity_model(
-    State(state): State<Arc<AppState>>,
-    Extension(Identity(_username)): Extension<Identity>,
-) -> Response {
-    let now = unix_now();
-    let from = now.saturating_sub(CAPACITY_MODEL_WINDOW);
-    let rollup = state.history.rollup(from, now, 60);
-    let totals = &rollup.totals;
-
-    let pool = state.pool();
-    let rpms = pool.rpms();
-    let calibration = pool.calibration_factors();
-    let effective_rpm: Vec<usize> = rpms
-        .iter()
-        .zip(calibration.iter())
-        .map(|(r, c)| ((*r).max(1) as f64 * c).round().max(1.0) as usize)
-        .collect();
-    let capacity_rpm: usize = effective_rpm.iter().sum();
-
-    let observed_rpm = req_count_to_rpm(
-        sum_metric(totals, "nimproxy_requests_total"),
-        CAPACITY_MODEL_WINDOW,
-    );
-
-    // Per-client: request totals + request-shape averages over the window.
-    let mut client_requests: BTreeMap<String, f64> = BTreeMap::new();
-    for mv in totals {
-        if mv.metric == "nimproxy_requests_total" {
-            if let Some(client) = mv.labels.get("client") {
-                *client_requests.entry(client.clone()).or_default() += mv.value;
-            }
-        }
-    }
-    let msg_s = sum_metric(totals, "nimproxy_request_messages_sum");
-    let msg_n = sum_metric(totals, "nimproxy_request_messages_count");
-    let tool_s = sum_metric(totals, "nimproxy_request_tools_sum");
-    let tool_n = sum_metric(totals, "nimproxy_request_tools_count");
-    let total_requests: f64 = client_requests.values().sum();
-
-    // Per-model: governor gate state plus operator-pinned overrides.
-    let mut model_caps: Vec<serde_json::Value> = state
-        .governor
-        .view()
-        .into_iter()
-        .map(|m| {
-            serde_json::json!({
-                "model": m.model,
-                "limit": m.limit,
-                "inflight": m.inflight,
-                "blocked": m.blocked,
-            })
-        })
-        .collect();
-    model_caps.sort_by(|a, b| a["model"].as_str().cmp(&b["model"].as_str()));
-    let overrides: BTreeMap<String, usize> = state
-        .cfg()
-        .governor
-        .overrides
-        .iter()
-        .map(|(m, c)| (m.clone(), *c))
-        .collect();
-
-    let upstream_s = sum_metric(totals, "nimproxy_upstream_seconds_sum");
-    let upstream_n = sum_metric(totals, "nimproxy_upstream_seconds_count");
-    let upstream_mean = if upstream_n > 0.0 {
-        upstream_s / upstream_n
-    } else {
-        f64::NAN
-    };
-    let tps_s = sum_metric(totals, "nimproxy_tokens_per_second_sum");
-    let tps_n = sum_metric(totals, "nimproxy_tokens_per_second_count");
-    let tps_mean = if tps_n > 0.0 { tps_s / tps_n } else { f64::NAN };
-
-    ok_json(serde_json::json!({
-        "sampled_at": now,
-        "window_seconds": CAPACITY_MODEL_WINDOW,
-        "per_key": {
-            "rpm": rpms,
-            "calibration": calibration,
-            "effective_rpm": effective_rpm,
-            "capacity_rpm": capacity_rpm,
-        },
-        "per_client": {
-            "count": client_requests.len(),
-            "total_requests": total_requests,
-            "observed_rpm": req_count_to_rpm(total_requests, CAPACITY_MODEL_WINDOW),
-            "avg_messages": if msg_n > 0.0 { msg_s / msg_n } else { f64::NAN },
-            "avg_tools": if tool_n > 0.0 { tool_s / tool_n } else { f64::NAN },
-        },
-        "per_model": {
-            "caps": model_caps,
-            "overrides": overrides,
-        },
-        "history_sample": {
-            "queue_wait_p50": quantile_from_totals(totals, "nimproxy_queue_wait_seconds", 0.5),
-            "queue_wait_p95": quantile_from_totals(totals, "nimproxy_queue_wait_seconds", 0.95),
-            "upstream_seconds_mean": upstream_mean,
-            "tokens_per_second_mean": tps_mean,
-            "ttft_p50": quantile_from_totals(totals, "nimproxy_ttft_seconds", 0.5),
-            "requests_per_min": observed_rpm,
-        },
-    }))
-}
-
-fn req_count_to_rpm(count: f64, window_seconds: u64) -> f64 {
-    if window_seconds == 0 {
-        0.0
-    } else {
-        count / window_seconds as f64 * 60.0
-    }
-}
-
-/// Gate the operator-queue surface. Permissions re-checked from the live
-/// store: a session whose user was deleted mid-flight gets a stale-session
-/// response, and any non-admin role is denied outright.
-fn operator_check(state: &AppState, username: &str) -> Result<(), Box<Response>> {
-    let role = state.store.lock().unwrap().user(username).map(|u| u.role);
-    match role {
-        Some(r) if r.is_admin() => Ok(()),
-        Some(_) => Err(Box::new(json_error(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "request queue requires an admin session",
-        ))),
-        None => Err(Box::new(json_error(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "your user no longer exists",
-        ))),
-    }
-}
-
 fn json_error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
     (
         status,
@@ -623,15 +393,9 @@ fn ok_json(v: serde_json::Value) -> Response {
     axum::Json(v).into_response()
 }
 
-/// The request queue: every in-flight `/v1` request (client · model · path ·
-/// phase · age), admin-only. Metadata only — never request content.
-async fn api_queue(
-    State(state): State<Arc<AppState>>,
-    Extension(Identity(username)): Extension<Identity>,
-) -> Response {
-    if let Err(resp) = operator_check(&state, &username) {
-        return *resp;
-    }
+/// The request queue: every in-flight `/v1` request (model · path · phase ·
+/// age), for the local operator. Metadata only — never request content.
+async fn api_queue(State(state): State<Arc<AppState>>) -> Response {
     let now = unix_now();
     let dispatch_policy = state
         .store
@@ -670,20 +434,16 @@ struct TerminateReq {
 }
 
 /// Terminate one in-flight request; its client receives error code `-91`.
-/// The admin may kill any request, including their own.
+/// Any local operator may kill any request, including their own.
 async fn api_queue_terminate(
     State(state): State<Arc<AppState>>,
-    Extension(Identity(username)): Extension<Identity>,
     axum::Json(req): axum::Json<TerminateReq>,
 ) -> Response {
-    if let Err(resp) = operator_check(&state, &username) {
-        return *resp;
-    }
     if state.registry.terminate(req.id) {
-        metrics::counter!("nimproxy_terminated_total", "by" => username.clone()).increment(1);
+        metrics::counter!("nimproxy_terminated_total", "by" => "local").increment(1);
         tracing::info!(
             request = req.id,
-            operator = %username,
+            operator = "local",
             "operator terminated an in-flight request (code -91)"
         );
         ok_json(serde_json::json!({ "ok": true }))
@@ -775,7 +535,6 @@ pub async fn run() {
         )
         .init();
 
-    let trust_proxy = env_or("TRUST_PROXY", "false") == "true";
     warn_legacy_env();
 
     // The config store is the app's source of truth and holds credentials,
@@ -793,7 +552,7 @@ pub async fn run() {
     if let Err(e) = writable {
         eprintln!(
             "\nnim-proxy cannot start: DATA_DIR {} is not writable ({e}).\n\
-             The config store (settings, users, keys) persists there.\n",
+             The config store (settings, keys) persists there.\n",
             data_dir.display()
         );
         std::process::exit(1);
@@ -806,16 +565,9 @@ pub async fn run() {
             std::process::exit(1);
         }
     };
-    let setup_required = stored.superuser().is_none();
     let cfg = stored.runtime();
     let port: u16 = env_or("PORT", "8000").parse().expect("PORT");
 
-    if setup_required {
-        tracing::warn!(
-            "SETUP REQUIRED — no superuser exists yet. The FIRST VISITOR to the dashboard \
-             claims this proxy; finish setup immediately. /v1 stays closed until then."
-        );
-    }
     tracing::info!(
         "config store      {}",
         config::store_path(&data_dir).display()
@@ -837,31 +589,13 @@ pub async fn run() {
             .map(|s| s.rpm)
             .sum::<usize>()
     );
-    tracing::info!(
-        "API auth          {}",
-        match &cfg.clients {
-            Some(c) => format!("keyed ({} client key(s))", c.len()),
-            None => "open (no client keys required — keep this on a trusted network)".to_owned(),
-        }
-    );
-    tracing::info!(
-        "dashboard auth    {}",
-        if setup_required {
-            "setup wizard (no users yet)".to_owned()
-        } else {
-            format!("session ({} user(s))", stored.users.len())
-        }
-    );
+    tracing::info!("API              open (/v1 needs no client key — local/host-only use)");
     tracing::info!(
         "patience          waits up to {}s per request, heartbeat every {}s",
         cfg.max_wait.as_secs(),
         cfg.heartbeat.as_secs()
     );
-    tracing::info!(
-        "dispatch          {} scheduling (aging {}s in fair mode)",
-        stored.dispatch.policy,
-        stored.dispatch.fair_aging_secs
-    );
+    tracing::info!("dispatch          {} scheduling", stored.dispatch.policy,);
 
     // Histogram bucket bounds, one row per metric.
     #[rustfmt::skip]
@@ -969,10 +703,6 @@ pub async fn run() {
     let upstream_selector =
         std::sync::Mutex::new(upstream::UpstreamSelector::new(cfg.upstreams.clone()));
 
-    let response_cache_ttl = stored.cache.ttl_secs;
-    let response_cache_max = stored.cache.max_entries;
-    gauge!("nimproxy_cache_entries").set(0.0);
-
     let state = Arc::new(AppState {
         dispatch: Dispatcher::new(pool.clone(), &stored.dispatch),
         pool,
@@ -985,7 +715,6 @@ pub async fn run() {
         models_cache: Mutex::new(None),
         no_inject: std::sync::Mutex::new(std::collections::HashSet::new()),
         model_labels: std::sync::Mutex::new(std::collections::HashSet::new()),
-        admin: Admin::new(trust_proxy),
         inflight: AtomicUsize::new(0),
         governor: Arc::new(governor::Governor::restored(&saved_governor)),
         history: hist,
@@ -999,10 +728,8 @@ pub async fn run() {
         sse_connections: AtomicUsize::new(0),
         store: std::sync::Mutex::new(stored),
         data_dir,
-        setup_required: std::sync::atomic::AtomicBool::new(setup_required),
         cfg: RwLock::new(Arc::new(cfg)),
         registry: Arc::new(registry::RequestRegistry::new()),
-        response_cache: cache::ResponseCache::new(response_cache_ttl, response_cache_max),
     });
 
     // Rate-state saver: persists the pool's windows + governor caps every
@@ -1033,7 +760,6 @@ pub async fn run() {
                             0.0
                         },
                     );
-                    gauge!("nimproxy_cache_entries").set(state.response_cache.len() as f64);
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -1046,52 +772,29 @@ pub async fn run() {
             include_str!("dashboard.html"),
         )
     };
-    // Session-gated surface: dashboard, config, history, metrics. The guard
-    // middleware requires an authenticated user (session cookie, or
-    // user:password header credentials for scrapers); pre-setup it routes
-    // everything to the wizard.
-    let protected = Router::new()
+    // Dashboard + settings + metrics surface: open to the local operator —
+    // there is no session gate (single-user, local deployment).
+    let app = Router::new()
         .route("/", get(dash))
         .route("/dash", get(dash))
         .route("/api/dashboard", get(api_dashboard))
         .route("/api/dashboard/now", get(api_dashboard_now))
         .route("/api/dashboard/stream", get(api_dashboard_stream))
-        .route("/api/dashboard/capacity-model", get(api_capacity_model))
         .route("/api/models", get(proxy::api_models))
         .route("/api/queue", get(api_queue))
         .route("/api/queue/terminate", post(api_queue_terminate))
         .route("/api/config", get(settings::api_config))
         .route("/api/settings/nim-keys", post(settings::nim_keys))
-        .route("/api/settings/clients", post(settings::clients))
         .route("/api/settings/upstream", post(settings::upstream))
         .route("/api/settings/limits", post(settings::limits))
         .route("/api/settings/pricing", post(settings::pricing))
         .route("/api/settings/history", post(settings::history))
         .route("/api/settings/governor", post(settings::governor_cfg))
         .route("/api/settings/recovery", post(settings::recovery))
-        .route("/api/settings/cache", post(settings::cache_cfg))
         .route("/api/settings/dispatch", post(settings::dispatch_cfg))
-        .route("/api/settings/users", post(settings::users))
-        .route("/api/settings/account", post(settings::account))
         .route("/api/settings/validate-key", post(settings::validate_key))
         .route("/metrics", get(metrics_text))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth::require_session,
-        ));
-
-    // Public surface: health probe, login flow, the first-run wizard (404
-    // once setup completes), and the API (its own key gate + setup gate).
-    let app = Router::new()
-        .merge(protected)
         .route("/health", get(|| async { "ok" }))
-        .route("/login", get(auth::login_page).post(auth::login_submit))
-        .route("/logout", post(auth::logout))
-        .route(
-            "/setup",
-            get(settings::setup_page).post(settings::setup_submit),
-        )
-        .route("/setup/validate-key", post(settings::setup_validate_key))
         .route("/v1/{*path}", any(proxy::handle))
         .layer(axum::middleware::from_fn(security_headers))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
@@ -1132,69 +835,5 @@ pub async fn run() {
     let limits = state.governor.limits();
     if let Err(e) = ratestate::save(&state.data_dir, &lanes, &limits) {
         tracing::warn!("final rate-state save failed: {e}");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn total(metric: &str, labels: &[(&str, &str)], value: f64) -> history::MetricValue {
-        history::MetricValue {
-            metric: metric.to_owned(),
-            labels: labels
-                .iter()
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-                .collect(),
-            value,
-        }
-    }
-
-    #[test]
-    fn sum_metric_sums_matching_series_only() {
-        let totals = vec![
-            total("nimproxy_queue_wait_seconds_sum", &[], 12.0),
-            total("nimproxy_queue_wait_seconds_count", &[], 4.0),
-            total("nimproxy_requests_total", &[("client", "a")], 10.0),
-            total("nimproxy_requests_total", &[("client", "b")], 5.0),
-        ];
-        assert_eq!(sum_metric(&totals, "nimproxy_requests_total"), 15.0);
-        assert_eq!(
-            sum_metric(&totals, "nimproxy_queue_wait_seconds_count"),
-            4.0
-        );
-        assert_eq!(sum_metric(&totals, "nimproxy_missing"), 0.0);
-    }
-
-    #[test]
-    fn quantile_from_totals_interpolates_across_cumulative_buckets() {
-        // 4 observations: 0.5, 0.5, 1.5, 1.5 seconds.
-        let totals = vec![
-            total("nimproxy_queue_wait_seconds_bucket", &[("le", "0.5")], 2.0),
-            total("nimproxy_queue_wait_seconds_bucket", &[("le", "1.0")], 2.0),
-            total("nimproxy_queue_wait_seconds_bucket", &[("le", "2.0")], 4.0),
-            total("nimproxy_queue_wait_seconds_bucket", &[("le", "+Inf")], 4.0),
-        ];
-        // p50 target = 2 observations -> lands atop the 0.5..1.0 bucket.
-        let p50 = quantile_from_totals(&totals, "nimproxy_queue_wait_seconds", 0.5).unwrap();
-        assert!((p50 - 0.5).abs() < 1e-9, "p50 = {p50}");
-        // p100 = all observations -> tops out at the last finite bucket.
-        let p100 = quantile_from_totals(&totals, "nimproxy_queue_wait_seconds", 1.0).unwrap();
-        assert!((p100 - 2.0).abs() < 1e-9, "p100 = {p100}");
-    }
-
-    #[test]
-    fn quantile_from_totals_empty_returns_none() {
-        assert_eq!(
-            quantile_from_totals(&[], "nimproxy_queue_wait_seconds", 0.5),
-            None
-        );
-    }
-
-    #[test]
-    fn req_count_to_rpm_scales_by_window() {
-        assert_eq!(req_count_to_rpm(60.0, 60), 60.0);
-        assert_eq!(req_count_to_rpm(30.0, 3600), 0.5);
-        assert_eq!(req_count_to_rpm(100.0, 0), 0.0);
     }
 }

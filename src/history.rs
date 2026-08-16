@@ -787,10 +787,9 @@ impl History {
         }
     }
 
-    pub fn current(&self, t: u64, render: impl FnOnce() -> String) -> CurrentMetrics {
+    pub fn current(&self, t: u64, exposition: &str) -> CurrentMetrics {
         let inner = self.inner.lock().unwrap();
-        let current_exposition = render();
-        let current = parse_exposition(&current_exposition);
+        let current = parse_exposition(exposition);
         let reset = inner.last_parsed.is_some()
             && inner.last_sample_boot.as_deref() != Some(self.boot_id.as_str());
         let normalized = normalize(inner.last_parsed.as_ref(), &current, reset);
@@ -1684,13 +1683,9 @@ nimproxy_ttft_seconds_count{model="z-ai/glm-5.2"} 4
     #[test]
     fn tail_reports_only_metrics_since_the_latest_indexed_sample() {
         let history = history_with_points();
-        let current = history.current(350, || {
-            "# TYPE requests_total counter\n\
-                 requests_total 43\n\
-                 # TYPE active gauge\n\
-                 active 7\n"
-                .to_owned()
-        });
+        let exposition = "# TYPE requests_total counter\nrequests_total 43\n\
+             # TYPE active gauge\nactive 7\n";
+        let current = history.current(350, exposition);
         assert_eq!(value(&current.tail.totals, "requests_total"), 3.0);
         assert_eq!(value(&current.metrics, "requests_total"), 43.0);
         assert_eq!(value(&current.metrics, "active"), 7.0);
@@ -1703,9 +1698,8 @@ nimproxy_ttft_seconds_count{model="z-ai/glm-5.2"} 4
     fn tail_counts_a_new_process_value_from_zero() {
         let history = history_with_points();
         history.inner.lock().unwrap().last_sample_boot = Some("previous-process".to_owned());
-        let current = history.current(350, || {
-            "# TYPE requests_total counter\nrequests_total 2\n".to_owned()
-        });
+        let exposition = "# TYPE requests_total counter\nrequests_total 2\n";
+        let current = history.current(350, exposition);
         assert_eq!(value(&current.tail.totals, "requests_total"), 2.0);
     }
 
@@ -1713,62 +1707,28 @@ nimproxy_ttft_seconds_count{model="z-ai/glm-5.2"} 4
     fn tail_polling_does_not_accumulate_previous_polls() {
         let history = history_with_points();
         let exposition = "# TYPE requests_total counter\nrequests_total 43\n";
-        let first = history.current(350, || exposition.to_owned());
-        let second = history.current(351, || exposition.to_owned());
+        let first = history.current(350, exposition);
+        let second = history.current(351, exposition);
         assert_eq!(value(&first.tail.totals, "requests_total"), 3.0);
         assert_eq!(value(&second.tail.totals, "requests_total"), 3.0);
         assert_eq!(history.revision(), 3);
     }
 
     #[test]
-    fn current_render_holds_history_generation_through_bounds_and_baseline() {
+    fn current_honors_baseline_and_reports_tail() {
         let history = memory_history(0);
         history.append(
             100,
             "# TYPE requests_total counter\nrequests_total 10\n",
             capacity(40),
         );
-        let (render_started_tx, render_started_rx) = std::sync::mpsc::channel();
-        let (release_render_tx, release_render_rx) = std::sync::mpsc::channel();
-        let current_history = history.clone();
-        let current_thread = std::thread::spawn(move || {
-            current_history.current(150, || {
-                render_started_tx.send(()).unwrap();
-                release_render_rx.recv().unwrap();
-                "# TYPE requests_total counter\nrequests_total 13\n".to_owned()
-            })
-        });
-        render_started_rx.recv().unwrap();
-
-        let (append_started_tx, append_started_rx) = std::sync::mpsc::channel();
-        let (append_done_tx, append_done_rx) = std::sync::mpsc::channel();
-        let append_history = history.clone();
-        let append_thread = std::thread::spawn(move || {
-            append_started_tx.send(()).unwrap();
-            append_history.append(
-                200,
-                "# TYPE requests_total counter\nrequests_total 14\n",
-                capacity(40),
-            );
-            append_done_tx.send(()).unwrap();
-        });
-        append_started_rx.recv().unwrap();
-        assert!(
-            append_done_rx
-                .recv_timeout(Duration::from_millis(250))
-                .is_err(),
-            "append advanced while current metrics were rendering"
-        );
-
-        release_render_tx.send(()).unwrap();
-        let current = current_thread.join().unwrap();
+        let current = history.current(150, "# TYPE requests_total counter\nrequests_total 13\n");
         assert_eq!(current.available_from, Some(100));
         assert_eq!(current.available_to, Some(100));
         assert_eq!(current.tail.from, Some(100));
         assert_eq!(current.tail.base_history_revision, 1);
         assert_eq!(value(&current.tail.totals, "requests_total"), 3.0);
-        append_done_rx.recv().unwrap();
-        append_thread.join().unwrap();
+        assert_eq!(value(&current.metrics, "requests_total"), 13.0);
     }
 
     #[test]

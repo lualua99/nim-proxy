@@ -6,6 +6,74 @@ description: Append-only record of ingests, decisions, and maintenance passes.
 
 # Log
 
+## [2026-08-15] ingest — removed redundant "connected +0" log line
+
+- `src/proxy.rs`: removed the `tracing::info!` line that logged every request
+  immediately on connection (e.g. `(connected +0)`). Each request previously
+  produced two log lines — one on connect and one on completion. The SSE
+  `: connected\n\n` event sent to the client is unchanged; only the redundant
+  log line was removed. The completion log in `record_request` continues to
+  report the duration.
+
+## [2026-08-15] ingest — capacity what-if simulator removed
+
+- `src/dashboard.html`: Capacity tab's "Capacity what-if" card (sliders +
+  M/M/1 M/M outputs) and its `whatif`/`capModel`/`simCapacity`/`loadCapacityModel`
+  JS are gone; the tab now ends at the per-lane table.
+- `src/lib.rs`: `GET /api/dashboard/capacity-model` route and
+  `api_capacity_model` handler removed along with `sum_metric`,
+  `quantile_from_totals`, `req_count_to_rpm` (no longer referenced anywhere).
+- `src/governor.rs`: `ModelView` and `Governor::view()` removed — the live
+  gate view had only one consumer.
+- `tests/e2e.rs`: `dashboard_capacity_model_contract_returns_aggregates`
+  removed. No other tally path changed.
+- `knowledge/decisions/capacity-simulator.md` deleted; `index.md` row dropped.
+  The M/M/1 approximation was never used operationally and added no signal
+  over the Capacity tab's existing Now/historical views.
+
+## [2026-08-14] ingest — single-operator local build (auth plane removed)
+
+Refactor ships the multi-user/auth surface out: deleted `src/auth.rs` and
+`src/setup.html`, the `User`/`Role`/`ClientAuth`/`ClientKey`/`Mode` types,
+`NimKey.owner`, `Config.clients`, `setup_required`/`Admin` state, the
+`/login /logout /setup*` routes and `/api/settings/{clients,users,account}`
+handlers, and the session/role middleware. `/v1` and the dashboard are open;
+every request is labeled `local`. Config `validate()` drops ownership and the
+pool-floor invariant. Cargo drops `hmac`/`subtle` (keeps `sha2` for key
+fingerprints, `getrandom` for the history boot ID). Unit 135 / e2e 77 tests,
+`cargo fmt` and `clippy --all-targets -D warnings` clean.
+
+- New decision: [single-user-local-build](decisions/single-user-local-build.md).
+- Retired: auth-posture (amended), [client-auth](architecture/client-auth.md)
+  (rewritten as historical), [sharing-with-friends](ops/sharing-with-friends.md)
+  (rewritten as historical); `configure-env`, `ui-managed-config-store`,
+  `dashboard`(architecture), and `test-strategy` updated; `TRUST_PROXY` and
+  lockout-recovery runbook removed. Index rows annotated.
+
+## [2026-08-14] ingest — prompt hang-up reaping of abandoned queued requests
+
+- `src/proxy.rs` streaming path: the permit and slot waits now race the
+  downstream `mpsc` sender's `closed()` (`tx.closed()`) instead of relying on
+  the next `: heartbeat` tick to notice a client that hung up. An abandoned
+  streaming request therefore frees its registry row, admissions gates, and
+  dispatch waiter immediately (milliseconds, not up to a whole `heartbeat`
+  interval) — so the operator queue no longer shows the ghost of a re-issued
+  request next to the harness's retry ("two entries for one logical request"),
+  and the ghost cannot burn an rpm slot it would otherwise win later.
+- New `stream_heartbeat()` helper: only a closed channel means "client gone";
+  a full buffer (slow-but-alive reader) skips the frame instead of aborting,
+  removing a spurious-drop path that could itself cause harness retry spikes.
+- e2e: `abandoned_streaming_waiter_unregisters_before_the_heartbeat` (row gone
+  within 2s vs a 3s heartbeat; ghost never hits upstream) and
+  `abandoned_buffered_waiter_unregisters` (locks the existing
+  axum-cancels-handler path for non-streaming waiters). Fixture note: with a
+  full-rate-limit window the dispatcher fail-fast fires unless `max_wait`
+  exceeds the window wait, so the tests use `max_wait_secs: 120` vs the ~60s
+  window.
+- Verified: `cargo test` 162 lib + 112 e2e green; `cargo fmt`, clippy
+  `-D warnings` clean. No rate-limit/upstream-selection behavior changed, so
+  the load harness requirement is unaffected.
+
 ## [2026-08-11] decision — response cache for idempotent requests
 
 Added an in-memory response cache (moka) serving repeat non-streaming

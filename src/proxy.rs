@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use metrics::{counter, gauge, histogram};
+use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -23,6 +24,35 @@ use crate::governor::{self, ModelPermit};
 use crate::pool::Signal;
 use crate::registry::Registered;
 use crate::{AppState, Config};
+
+/// Lightweight extraction of the few fields the proxy reads from every
+/// request body, using `RawValue` to borrow message text directly from the
+/// wire bytes — no full DOM allocation for the conversation history.
+#[derive(Deserialize)]
+struct BodyInfo<'a> {
+    #[serde(default)]
+    model: Option<&'a str>,
+    #[serde(default)]
+    stream: Option<bool>,
+    #[serde(default, borrow)]
+    messages: Option<Vec<&'a serde_json::value::RawValue>>,
+    #[serde(default)]
+    stream_options: Option<serde_json::Value>,
+    #[serde(default)]
+    tools: Option<serde_json::Value>,
+    #[serde(default)]
+    functions: Option<serde_json::Value>,
+    #[serde(default)]
+    max_tokens: Option<u64>,
+    #[serde(default)]
+    max_completion_tokens: Option<u64>,
+    #[serde(default)]
+    temperature: Option<f64>,
+    #[serde(default)]
+    response_format: Option<serde_json::Value>,
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
+}
 
 /// Per-request metric labels, resolved once up front.
 #[derive(Clone)]
@@ -74,9 +104,10 @@ fn wait_deadline(cfg: &Config) -> Instant {
 /// Prometheus exposition, structured logs, and terminals), and cap length.
 fn sanitize_label(raw: &str) -> String {
     let cleaned: String = raw
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ':'))
+        .bytes()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-' | b'/' | b':'))
         .take(64)
+        .map(|c| c as char)
         .collect();
     if cleaned.is_empty() {
         "none".to_owned()
@@ -111,11 +142,9 @@ fn bounded_label(seen: &mut std::collections::HashSet<String>, s: String, cap: u
 /// (arbitrary sub-paths a client can hit under /v1/) becomes "other".
 fn label_path(path: &str) -> String {
     match path {
-        "/v1/chat/completions"
-        | "/v1/completions"
-        | "/v1/embeddings"
-        | "/v1/models"
-        | "/v1/rankings" => path.to_owned(),
+        "/v1/chat/completions" | "/v1/completions" | "/v1/embeddings" | "/v1/models" => {
+            path.to_owned()
+        }
         _ => "other".to_owned(),
     }
 }
@@ -320,8 +349,8 @@ fn finish_label(raw: &str) -> String {
 /// The request's tool-selection mode, bounded to a small enum. Called only
 /// when the request offers tools, so a missing `tool_choice` means the
 /// provider default (auto).
-fn tool_choice_mode(v: &serde_json::Value) -> &'static str {
-    match v.get("tool_choice") {
+fn tool_choice_mode(v: Option<&serde_json::Value>) -> &'static str {
+    match v {
         Some(serde_json::Value::String(s)) => match s.as_str() {
             "auto" => "auto",
             "none" => "none",
@@ -334,21 +363,19 @@ fn tool_choice_mode(v: &serde_json::Value) -> &'static str {
 }
 
 /// Count tools offered in a request body (`tools`, or legacy `functions`).
-fn count_tools(v: &serde_json::Value) -> Option<usize> {
-    v.get("tools")
+fn count_tools(
+    tools: Option<&serde_json::Value>,
+    functions: Option<&serde_json::Value>,
+) -> Option<usize> {
+    tools
         .and_then(|t| t.as_array())
         .map(|a| a.len())
-        .or_else(|| {
-            v.get("functions")
-                .and_then(|t| t.as_array())
-                .map(|a| a.len())
-        })
+        .or_else(|| functions.and_then(|t| t.as_array()).map(|a| a.len()))
 }
 
 /// Whether the request asks for structured (JSON) output.
-fn is_json_mode(v: &serde_json::Value) -> bool {
-    v.get("response_format")
-        .and_then(|rf| rf.get("type"))
+fn is_json_mode(v: Option<&serde_json::Value>) -> bool {
+    v.and_then(|rf| rf.get("type"))
         .and_then(|t| t.as_str())
         .is_some_and(|t| t == "json_object" || t == "json_schema")
 }
@@ -357,36 +384,37 @@ fn is_json_mode(v: &serde_json::Value) -> bool {
 /// conversation depth, tools offered, sampling params, output cap, JSON mode).
 /// Counts and sizes only — never message content. All heavy values go to
 /// histograms, never labels, so cardinality stays bounded.
-fn record_shape(ctx: &Ctx, parsed: Option<&serde_json::Value>, wants_stream: bool) {
-    // Labeled by client: request shape reflects the harness, not the model —
-    // this is what powers the Harnesses view ("what is each agent doing").
+#[allow(clippy::too_many_arguments)]
+fn record_shape(
+    ctx: &Ctx,
+    wants_stream: bool,
+    msg_count: Option<usize>,
+    tool_count: Option<usize>,
+    tool_choice: &'static str,
+    max_tokens: Option<u64>,
+    temperature: Option<f64>,
+    json_mode: bool,
+) {
     counter!(
         "nimproxy_stream_requests_total",
         "client" => ctx.client.clone(),
         "stream" => if wants_stream { "true" } else { "false" }.to_owned(),
     )
     .increment(1);
-    let Some(v) = parsed else { return };
-    if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
-        histogram!("nimproxy_request_messages", "client" => ctx.client.clone())
-            .record(msgs.len() as f64);
+    if let Some(n) = msg_count {
+        histogram!("nimproxy_request_messages", "client" => ctx.client.clone()).record(n as f64);
     }
-    if let Some(n) = count_tools(v) {
+    if let Some(n) = tool_count {
         histogram!("nimproxy_request_tools", "client" => ctx.client.clone()).record(n as f64);
-        counter!("nimproxy_tool_choice_total", "mode" => tool_choice_mode(v).to_owned())
-            .increment(1);
+        counter!("nimproxy_tool_choice_total", "mode" => tool_choice.to_owned()).increment(1);
     }
-    if let Some(mt) = v
-        .get("max_tokens")
-        .and_then(|x| x.as_u64())
-        .or_else(|| v.get("max_completion_tokens").and_then(|x| x.as_u64()))
-    {
+    if let Some(mt) = max_tokens {
         histogram!("nimproxy_request_max_tokens", "client" => ctx.client.clone()).record(mt as f64);
     }
-    if let Some(t) = v.get("temperature").and_then(|x| x.as_f64()) {
+    if let Some(t) = temperature {
         histogram!("nimproxy_request_temperature", "client" => ctx.client.clone()).record(t);
     }
-    if is_json_mode(v) {
+    if json_mode {
         counter!("nimproxy_json_mode_total", "client" => ctx.client.clone()).increment(1);
     }
 }
@@ -425,6 +453,9 @@ fn record_quality(
 #[derive(Default)]
 struct SseScan {
     buf: String,
+    /// Offset into `buf` where unprocessed data starts. Avoids O(n) drain per
+    /// line — the old `buf.drain(..nl)` shifted the entire tail on every event.
+    pos: usize,
     events: u64,
     prompt: Option<u64>,
     completion: Option<u64>,
@@ -437,9 +468,11 @@ struct SseScan {
 impl SseScan {
     fn feed(&mut self, bytes: &[u8]) {
         self.buf.push_str(&String::from_utf8_lossy(bytes));
-        while let Some(pos) = self.buf.find('\n') {
-            let line: String = self.buf.drain(..=pos).collect();
-            let line = line.trim();
+        let tail = self.buf.as_str();
+        while let Some(nl) = tail[self.pos..].find('\n') {
+            let line_end = self.pos + nl;
+            let line = tail[self.pos..line_end].trim();
+            self.pos = line_end + 1;
             if let Some(data) = line.strip_prefix("data:").map(str::trim_start) {
                 if data == "[DONE]" {
                     continue;
@@ -494,6 +527,10 @@ impl SseScan {
             }
         }
         // Guard against a pathological never-terminated line.
+        if self.pos > 0 && self.buf.len() > 1_048_576 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
         if self.buf.len() > 1_048_576 {
             self.buf.clear();
         }
@@ -531,14 +568,6 @@ pub async fn handle(
     body: Bytes,
 ) -> Response {
     let accepted = Instant::now();
-    // Fail closed until first-time setup completes: nothing proxies, and the
-    // error tells the operator exactly why.
-    if state
-        .setup_required
-        .load(std::sync::atomic::Ordering::SeqCst)
-    {
-        return crate::auth::setup_required_json();
-    }
 
     // One consistent config view for this request's whole lifetime; a
     // concurrent settings save affects only requests that arrive after it.
@@ -565,34 +594,10 @@ pub async fn handle(
         return overloaded(cfg.max_inflight);
     }
 
-    // Client auth: open mode admits everyone as "local"; keyed mode hashes
-    // the presented bearer and compares against the stored SHA-256 digests
-    // (the store never holds a usable token). Comparisons are constant-time.
-    let client = match &cfg.clients {
-        None => "local".to_owned(),
-        Some(clients) => {
-            let token = headers
-                .get(header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer "))
-                .unwrap_or("");
-            let digest = crate::auth::sha256_hex(token);
-            let mut matched = None;
-            for (stored_digest, name) in clients {
-                if crate::auth::ct_eq(&digest, stored_digest) {
-                    matched = Some(name.clone());
-                }
-            }
-            match matched {
-                Some(name) => name,
-                None => {
-                    counter!("nimproxy_unauthorized_total").increment(1);
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    return unauthorized();
-                }
-            }
-        }
-    };
+    // Client identity: this is a single-operator local deployment, so every
+    // request is labeled "local" — metric labels, logs, and the request queue
+    // all key off it, and the dashboard's per-client views collapse to one row.
+    let client = "local".to_owned();
 
     let request_deadline = match parse_request_deadline(&headers, accepted) {
         Ok(deadline) => deadline,
@@ -604,11 +609,55 @@ pub async fn handle(
         .map(|pq| pq.as_str().to_owned())
         .unwrap_or_else(|| uri.path().to_owned());
 
-    let mut parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
-    let raw_model = parsed
-        .as_ref()
-        .and_then(|v| v.get("model").and_then(|m| m.as_str()))
-        .unwrap_or("none");
+    let (
+        raw_model,
+        wants_stream,
+        prefer,
+        msg_count,
+        tool_count,
+        tool_choice_mode_val,
+        max_tokens,
+        temperature,
+        json_mode,
+    ) = {
+        // Extract the handful of fields the proxy reads from the body
+        // without building a full Value DOM. The BodyInfo borrows from
+        // `body`, so this block is scoped to drop the borrow before the
+        // body is moved below.
+        let info = serde_json::from_slice::<BodyInfo>(&body).ok();
+        let raw_model = info.as_ref().and_then(|i| i.model).unwrap_or("none");
+        let wants_stream = info.as_ref().and_then(|i| i.stream).unwrap_or(false);
+        let prefer = affinity_raw(&body, state.pool().len());
+        let msg_count = info
+            .as_ref()
+            .and_then(|i| i.messages.as_ref().map(|m| m.len()));
+        let tool_count = info
+            .as_ref()
+            .and_then(|i| count_tools(i.tools.as_ref(), i.functions.as_ref()));
+        let tool_choice_mode_val = info
+            .as_ref()
+            .map(|i| tool_choice_mode(i.tool_choice.as_ref()))
+            .unwrap_or("auto");
+        let max_tokens = info
+            .as_ref()
+            .and_then(|i| i.max_tokens.or(i.max_completion_tokens));
+        let temperature = info.as_ref().and_then(|i| i.temperature);
+        let json_mode = info
+            .as_ref()
+            .and_then(|i| i.response_format.as_ref())
+            .is_some_and(|rf| is_json_mode(Some(rf)));
+        (
+            raw_model,
+            wants_stream,
+            prefer,
+            msg_count,
+            tool_count,
+            tool_choice_mode_val,
+            max_tokens,
+            temperature,
+            json_mode,
+        )
+    };
     let ctx = Ctx {
         client,
         model: label_model(&state, raw_model),
@@ -636,41 +685,6 @@ pub async fn handle(
         return resp;
     }
 
-    let wants_stream = parsed
-        .as_ref()
-        .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
-        .unwrap_or(false);
-    let prefer = parsed
-        .as_ref()
-        .and_then(|v| affinity(v, state.pool().len()));
-
-    // Fast path: response cache hit for idempotent non-streaming requests.
-    // Skip the rate-limit queue, upstream call, and every downstream step.
-    // The computed key rides along to `buffered` so a miss can be written back
-    // on a successful upstream exchange.
-    let response_cache_key = if !wants_stream && request_deadline.is_none() {
-        let key = state
-            .response_cache
-            .key_for(&ctx.model, &ctx.path, &body, false);
-        if let Some(ref key) = key {
-            if let Some(hit) = state.response_cache.get(key) {
-                metrics::counter!("nimproxy_cache_hits_total", "path" => ctx.path.clone())
-                    .increment(1);
-                record_request(&ctx, hit.status.as_str());
-                return Response::builder()
-                    .status(hit.status)
-                    .header(header::CONTENT_TYPE, &hit.content_type)
-                    .body(axum::body::Body::from(hit.body))
-                    .unwrap();
-            }
-            metrics::counter!("nimproxy_cache_misses_total", "path" => ctx.path.clone())
-                .increment(1);
-        }
-        key
-    } else {
-        None
-    };
-
     // Register in the operator request queue. The entry doubles as the kill
     // switch: an admin can terminate this request and the client sees error
     // code -91. The entry lives for exactly this request's lifetime (RAII).
@@ -683,48 +697,38 @@ pub async fn handle(
 
     // Fingerprint what the harness asked for (generation endpoints only).
     if ctx.path == "/v1/chat/completions" || ctx.path == "/v1/completions" {
-        record_shape(&ctx, parsed.as_ref(), wants_stream);
+        record_shape(
+            &ctx,
+            wants_stream,
+            msg_count,
+            tool_count,
+            tool_choice_mode_val,
+            max_tokens,
+            temperature,
+            json_mode,
+        );
     }
 
     // Usage injection: streamed responses only report exact token usage when
     // asked via stream_options, so ask on the client's behalf. `fallback`
     // keeps the untouched body for a one-shot retry if the model rejects it.
+    // Only parses the full `Value` DOM when injection is actually needed.
     let mut body = body;
     let mut fallback = None;
     if wants_stream && !cfg.strict_passthrough && uri.path() == "/v1/chat/completions" {
-        let injectable = parsed
-            .as_ref()
-            .is_some_and(|v| v.is_object() && v.get("stream_options").is_none())
+        let injectable = serde_json::from_slice::<BodyInfo>(&body)
+            .ok()
+            .is_some_and(|info| info.stream_options.is_none())
             && !state.no_inject.lock().unwrap().contains(&ctx.model);
         if injectable {
-            // `parsed` is unused after this point, so move it rather than deep-
-            // cloning the whole request body (the full conversation) to inject
-            // one field.
-            let mut v = parsed.take().unwrap();
-            v["stream_options"] = serde_json::json!({ "include_usage": true });
-            fallback = Some(std::mem::replace(
-                &mut body,
-                Bytes::from(serde_json::to_vec(&v).expect("serialize injected body")),
-            ));
+            if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) {
+                v["stream_options"] = serde_json::json!({ "include_usage": true });
+                fallback = Some(std::mem::replace(
+                    &mut body,
+                    Bytes::from(serde_json::to_vec(&v).expect("serialize injected body")),
+                ));
+            }
         }
-    }
-
-    // Backpressure gate: if the estimated queue wait exceeds the threshold,
-    // reject immediately with 503 + Retry-After instead of letting the request
-    // queue. Requests carrying an explicit deadline are exempt — they already
-    // have a binding bound and dropping them would deny their only path.
-    let backpressure_eta = if cfg.backpressure_enabled && request_deadline.is_none() {
-        state.dispatch.eta(prefer)
-    } else {
-        None
-    };
-    let backpressure_reject =
-        backpressure_eta.filter(|eta| *eta >= cfg.backpressure_queue_threshold_eta);
-
-    if let Some(eta) = backpressure_reject {
-        counter!("nimproxy_backpressure_total", "kind" => "reject").increment(1);
-        histogram!("nimproxy_backpressure_rejected_eta_seconds").record(eta.as_secs_f64());
-        return backpressure_rejected(eta);
     }
 
     if wants_stream {
@@ -753,7 +757,6 @@ pub async fn handle(
             request_deadline,
             deadline,
             registered,
-            backpressure_eta,
         )
     } else {
         let wait = wait_deadline(&cfg);
@@ -774,7 +777,6 @@ pub async fn handle(
             deadline,
             request_deadline,
             registered,
-            response_cache_key,
         );
         if let Some(deadline) = request_deadline {
             match tokio::time::timeout_at(deadline.0.into(), work).await {
@@ -795,15 +797,15 @@ pub async fn handle(
 /// every turn of an agent session) so a conversation keeps hitting the same key
 /// while it has capacity, keeping any upstream prefix cache warm. Purely an
 /// optimization; correctness never depends on which key serves a request.
-fn affinity(body: &serde_json::Value, lanes: usize) -> Option<usize> {
-    let messages = body.get("messages")?.as_array()?;
+/// Accepts the raw body bytes to avoid building a full Value DOM for the
+/// conversation history — the messages are hashed from their raw JSON text.
+fn affinity_raw(body: &[u8], lanes: usize) -> Option<usize> {
+    let info: BodyInfo = serde_json::from_slice(body).ok()?;
+    let messages = info.messages.as_ref()?;
     let mut h = DefaultHasher::new();
-    body.get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("")
-        .hash(&mut h);
+    info.model.unwrap_or("").hash(&mut h);
     for msg in messages.iter().take(2) {
-        msg.to_string().hash(&mut h);
+        msg.get().hash(&mut h);
     }
     Some((h.finish() % lanes as u64) as usize)
 }
@@ -854,7 +856,6 @@ async fn buffered(
     deadline: Instant,
     request_deadline: Option<RequestDeadline>,
     registered: Registered,
-    response_cache_key: Option<String>,
 ) -> Response {
     let _active = crate::dispatch::scopeguard(|| gauge!("nimproxy_active_requests").decrement(1.0));
     gauge!("nimproxy_active_requests").increment(1.0);
@@ -951,37 +952,7 @@ async fn buffered(
             histogram!("nimproxy_upstream_seconds", "model" => ctx.model.clone())
                 .record(sent_at.elapsed().as_secs_f64());
             record_request(&ctx, resp.status().as_str());
-            let response = relay(resp, &ctx).await;
-            // Cache the response on success, when a cache key is available.
-            if response.status().is_success() {
-                if let Some(ref key) = response_cache_key {
-                    let content_type = response
-                        .headers()
-                        .get(axum::http::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("application/json")
-                        .to_owned();
-                    let status = response.status();
-                    let body = axum::body::to_bytes(response.into_body(), 64 * 1024 * 1024).await;
-                    if let Ok(body) = body {
-                        state
-                            .response_cache
-                            .set(key, status, content_type.clone(), body.clone());
-                        return Response::builder()
-                            .status(status)
-                            .header(axum::http::header::CONTENT_TYPE, &content_type)
-                            .body(axum::body::Body::from(body))
-                            .unwrap();
-                    }
-                    // Fall through to the non-cached path if to_bytes failed.
-                    return Response::builder()
-                        .status(status)
-                        .header(axum::http::header::CONTENT_TYPE, &content_type)
-                        .body(axum::body::Body::from(Bytes::new()))
-                        .unwrap();
-                }
-            }
-            return response;
+            return relay(resp, &ctx).await;
         }
     };
     if *kill.borrow() {
@@ -991,6 +962,20 @@ async fn buffered(
         _ = kill.changed() => terminated_response(&term_ctx),
         resp = work => resp,
     }
+}
+
+/// Streaming keepalive: report whether the client is still there while a
+/// permit/slot wait runs. Only a *closed* response channel means the client
+/// hung up (abort immediately); a full buffer just means a slow-but-alive
+/// reader, which must not be mistaken for a disconnect — that spurious abort
+/// would make the harness error out and re-issue, surfacing as a duplicate
+/// queue entry.
+fn stream_heartbeat(tx: &mpsc::Sender<Result<Bytes, std::io::Error>>) -> bool {
+    if tx.is_closed() {
+        return false;
+    }
+    let _ = tx.try_send(Ok(Bytes::from_static(b": heartbeat\n\n")));
+    true
 }
 
 /// Streaming: commit to a 200 SSE response immediately and emit `: heartbeat`
@@ -1011,7 +996,6 @@ fn streaming(
     request_deadline: Option<RequestDeadline>,
     deadline: Instant,
     registered: Registered,
-    backpressure_eta: Option<Duration>,
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
 
@@ -1045,12 +1029,23 @@ fn streaming(
                 // permit spans the whole upstream exchange and drops on every
                 // exit from this iteration.
                 state.registry.set_phase(id, "waiting_permit");
-                let Ok(_permit) = acquire_model_permit(&state, &cfg, &ctx, deadline, || {
-                    tx.try_send(Ok(Bytes::from_static(b": heartbeat\n\n")))
-                        .is_ok()
-                })
-                .await
-                else {
+                // A client hang-up during the wait must free the queue row and
+                // gates immediately — not at the next heartbeat — so an abandoned
+                // request never lingers next to its retry in the operator view.
+                let permit = tokio::select! {
+                    _ = tx.closed() => {
+                        record_request(&ctx, "disconnect");
+                        return;
+                    }
+                    permit = acquire_model_permit(
+                        &state,
+                        &cfg,
+                        &ctx,
+                        deadline,
+                        || stream_heartbeat(&tx),
+                    ) => permit,
+                };
+                let Ok(_permit) = permit else {
                     record_request(&ctx, "504");
                     let _ = tx
                         .send(Ok(queue_expired_sse(
@@ -1068,12 +1063,20 @@ fn streaming(
                     return;
                 };
                 state.registry.set_phase(id, "waiting_slot");
-                let slot =
-                    reserve_slot(&state, cfg.heartbeat, deadline, prefer, &ctx.client, || {
-                        tx.try_send(Ok(Bytes::from_static(b": heartbeat\n\n")))
-                            .is_ok()
-                    })
-                    .await;
+                let slot = tokio::select! {
+                    _ = tx.closed() => {
+                        record_request(&ctx, "disconnect");
+                        return;
+                    }
+                    slot = reserve_slot(
+                        &state,
+                        cfg.heartbeat,
+                        deadline,
+                        prefer,
+                        &ctx.client,
+                        || stream_heartbeat(&tx),
+                    ) => slot,
+                };
                 let Some(slot) = slot else {
                     record_request(&ctx, "504");
                     let _ = tx
@@ -1263,7 +1266,7 @@ fn streaming(
         };
         // Kill switch: a latched signal ends the request with error -91 no
         // matter where it is — queued for a slot, riding out a retry wait, in
-        // the middle of a stream, or parked on backpressure. `changed()` is
+        // the middle of a stream. `changed()` is
         // edge-triggered, so the `borrow()` pre-check covers a kill that
         // landed before this select; any later kill resolves `changed()`
         // immediately because the value differs from what the receiver saw.
@@ -1298,14 +1301,10 @@ fn streaming(
         }
     });
 
-    let mut builder = Response::builder()
+    let builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache");
-    if let Some(eta) = backpressure_eta {
-        counter!("nimproxy_backpressure_total", "kind" => "eta").increment(1);
-        builder = builder.header("X-Nim-Proxy-Eta", eta.as_secs().to_string());
-    }
     builder
         .body(Body::from_stream(ReceiverStream::new(rx)))
         .unwrap()
@@ -1589,19 +1588,6 @@ fn json_response(status: StatusCode, body: Bytes) -> Response {
         .unwrap()
 }
 
-fn unauthorized() -> Response {
-    let body = proxy_error_json(
-        "unauthorized",
-        "missing or invalid proxy API key (Authorization: Bearer ...)",
-    );
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Bearer")],
-        axum::Json(body),
-    )
-        .into_response()
-}
-
 fn invalid_deadline() -> Response {
     let body = proxy_error_json(
         "invalid_deadline",
@@ -1623,18 +1609,6 @@ fn overloaded(max_inflight: usize) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         [(header::RETRY_AFTER, "5")],
-        axum::Json(body),
-    )
-        .into_response()
-}
-
-fn backpressure_rejected(eta: Duration) -> Response {
-    let secs = eta.as_secs().max(1);
-    let body = proxy_error_json("backpressure", format!("queue full; retry after {secs} s"));
-    let retry = header::HeaderValue::from_str(&secs.to_string()).unwrap();
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        [(header::RETRY_AFTER, retry)],
         axum::Json(body),
     )
         .into_response()
@@ -1707,10 +1681,8 @@ mod tests {
 
     #[test]
     fn tool_choice_mode_maps_unknown_strings_to_other() {
-        // auto / none / required / named are covered elsewhere; an unrecognized
-        // string must collapse to the bounded "other" label, not pass through.
         assert_eq!(
-            tool_choice_mode(&serde_json::json!({"tool_choice": "banana"})),
+            tool_choice_mode(Some(&serde_json::json!("banana"))),
             "other"
         );
     }
@@ -1718,13 +1690,9 @@ mod tests {
     #[test]
     fn sse_scan_clears_a_pathological_unterminated_line() {
         let mut scan = SseScan::default();
-        // >1 MiB with no newline: the guard clears the buffer instead of letting
-        // an abusive upstream grow it without bound.
         scan.feed(&vec![b'x'; 1_048_577]);
         assert!(scan.buf.is_empty(), "oversized line buffer must be dropped");
         assert_eq!(scan.events, 0);
-        // The guard drops the runaway buffer without wedging the scanner: a
-        // normal event still parses immediately afterward.
         scan.feed(b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":3}}\n\n");
         assert_eq!(scan.events, 1);
         assert_eq!(scan.completion, Some(3));
@@ -1733,7 +1701,6 @@ mod tests {
     #[test]
     fn scan_counts_events_and_finds_usage() {
         let mut scan = SseScan::default();
-        // Feed in awkwardly split chunks to exercise line reassembly.
         scan.feed(b": heartbeat\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"cho");
         scan.feed(b"ices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":45}}\n\ndata: [DONE]\n\n");
         assert_eq!(scan.events, 2);
@@ -1752,9 +1719,6 @@ mod tests {
     #[test]
     fn scan_captures_finish_reason_tool_calls_and_reasoning() {
         let mut scan = SseScan::default();
-        // A content delta (finish_reason:null — skipped), two tool-call deltas
-        // (indices 0 and 1), then a final chunk with finish_reason + usage that
-        // carries reasoning-token details.
         scan.feed(
             b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}\n\n",
         );
@@ -1763,7 +1727,7 @@ mod tests {
         scan.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
         scan.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":8,\"completion_tokens_details\":{\"reasoning_tokens\":5}}}\n\ndata: [DONE]\n\n");
         assert_eq!(scan.finish_reason.as_deref(), Some("tool_calls"));
-        assert_eq!(scan.tool_call_max, Some(1)); // +1 => 2 tool calls
+        assert_eq!(scan.tool_call_max, Some(1));
         assert_eq!(scan.reasoning, Some(5));
         assert_eq!(scan.completion, Some(8));
     }
@@ -1778,33 +1742,23 @@ mod tests {
 
     #[test]
     fn tool_choice_and_shape_readers() {
-        let auto = serde_json::json!({"tools": [{}], "tool_choice": "auto"});
-        assert_eq!(tool_choice_mode(&auto), "auto");
-        let named = serde_json::json!({"tool_choice": {"type": "function"}});
-        assert_eq!(tool_choice_mode(&named), "named");
-        // tools present, no explicit choice -> provider default (auto)
-        assert_eq!(
-            tool_choice_mode(&serde_json::json!({"tools": [{}]})),
-            "auto"
-        );
+        assert_eq!(tool_choice_mode(Some(&serde_json::json!("auto"))), "auto");
+        let named = serde_json::json!({"type": "function"});
+        assert_eq!(tool_choice_mode(Some(&named)), "named");
+        assert_eq!(tool_choice_mode(None), "auto");
 
         assert_eq!(
-            count_tools(&serde_json::json!({"tools": [{}, {}, {}]})),
+            count_tools(Some(&serde_json::json!([{}, {}, {}])), None,),
             Some(3)
         );
-        assert_eq!(
-            count_tools(&serde_json::json!({"functions": [{}]})),
-            Some(1)
-        );
-        assert_eq!(count_tools(&serde_json::json!({"model": "x"})), None);
+        assert_eq!(count_tools(None, Some(&serde_json::json!([{}])),), Some(1));
+        assert_eq!(count_tools(None, None), None);
 
-        assert!(is_json_mode(
-            &serde_json::json!({"response_format": {"type": "json_object"}})
-        ));
-        assert!(!is_json_mode(
-            &serde_json::json!({"response_format": {"type": "text"}})
-        ));
-        assert!(!is_json_mode(&serde_json::json!({"model": "x"})));
+        assert!(is_json_mode(Some(
+            &serde_json::json!({"type": "json_object"})
+        )));
+        assert!(!is_json_mode(Some(&serde_json::json!({"type": "text"}))));
+        assert!(!is_json_mode(None));
     }
 
     #[test]

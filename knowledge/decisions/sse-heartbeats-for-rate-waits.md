@@ -45,3 +45,17 @@ traffic streams.
 - A stalled upstream would hold the committed stream forever, hence the
   `stream_idle` cutoff in the
   [streaming pipeline](../architecture/streaming-pipeline.md).
+
+### Hang-up reaping (2026-08-14)
+
+While a request parks in the permit or slot wait, a harness that gives up and
+re-issues the same call must not leave its abandoned row in the operator queue
+next to the fresh retry. The heartbeat keeps an alive client seen, but notice
+of a dead one used to wait for the next `: heartbeat` tick. The wait now races
+`tx.closed()` directly (the SSE channel closes the moment hyper drops the
+response body on hang-up), so the abandoned row, its admissions waiters, and
+any dispatch queue position are freed within milliseconds, and the ghost can
+never go on to win an rpm slot. Buffered requests were already covered by axum
+cancelling the stalled handler when the socket closes; a test locks that in.
+Only a *closed* channel counts as a client gone — a full frames buffer is a
+slow-but-alive reader and simply skips the heartbeat frame.

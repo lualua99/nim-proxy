@@ -263,97 +263,49 @@ fn sse(body: Body) -> Response {
         .unwrap()
 }
 
-/// Test identity every store fixture contains: a superuser with a cheap
-/// (1000-iteration) precomputed password hash — the iteration count is
-/// encoded per hash, so the proxy verifies it with zero prod impact.
-pub const TEST_USER: &str = "root";
-pub const TEST_PASSWORD: &str = "test-password-1";
-const TEST_HASH: &str = "pbkdf2-sha256$1000$00000000000000000000000000000000$dd5fe0be04ca7f9e24642561a5d4635c52c40be82cbd7587b5eddc913ad3c7a7";
-
-pub fn sha256_hex(s: &str) -> String {
-    use sha2::Digest;
-    let d = sha2::Sha256::digest(s.as_bytes());
-    d.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// A config-store fixture. Defaults mirror the old test posture: open /v1,
-/// three NIM keys at 40 rpm, short waits, 1s heartbeat.
+/// A config-store fixture. Defaults mirror the test posture: three NIM keys
+/// at 40 rpm against the mock, short waits, 1s heartbeat.
 pub struct StoreOpts {
-    /// Open /v1 (no client keys needed). False = keyed mode.
-    pub open: bool,
-    /// (name, plaintext secret) client keys; stored as SHA-256 digests.
-    pub clients: Vec<(String, String)>,
-    /// (key, rpm) NIM keys, all enabled and owned by TEST_USER.
+    /// (key, rpm) NIM keys, all enabled.
     pub nim_keys: Vec<(String, usize)>,
     /// Ordered upstream endpoint list; empty = single-endpoint (`upstream`).
     pub upstreams: Vec<String>,
-    /// Additional users (username, role: "admin" | "user"), all sharing
-    /// TEST_PASSWORD.
-    pub extra_users: Vec<(String, String)>,
     pub max_wait_secs: u64,
     pub heartbeat_secs: u64,
     pub stream_idle_secs: u64,
     pub request_timeout_secs: u64,
     pub max_inflight: usize,
     pub strict_passthrough: bool,
-    pub backpressure_enabled: bool,
-    pub backpressure_queue_threshold_eta_secs: u64,
-    /// Response cache TTL in seconds; 0 = disabled (default, to not break
-    /// existing rate-limit tests).
-    pub cache_ttl_secs: u64,
-    /// Response cache max entries (ignored when TTL is 0).
-    pub cache_max_entries: u64,
 }
 
 impl Default for StoreOpts {
     fn default() -> Self {
         Self {
-            open: true,
-            clients: Vec::new(),
             nim_keys: vec![
                 ("test-key-0".into(), 40),
                 ("test-key-1".into(), 40),
                 ("test-key-2".into(), 40),
             ],
             upstreams: Vec::new(),
-            extra_users: Vec::new(),
             max_wait_secs: 30,
             heartbeat_secs: 1,
             stream_idle_secs: 300,
             request_timeout_secs: 300,
             max_inflight: 512,
             strict_passthrough: false,
-            backpressure_enabled: false,
-            backpressure_queue_threshold_eta_secs: 20,
-            cache_ttl_secs: 0,
-            cache_max_entries: 1024,
         }
     }
 }
 
 impl StoreOpts {
     pub fn json(&self, upstream: &str) -> serde_json::Value {
-        let mut users = vec![serde_json::json!({
-            "username": TEST_USER, "password_hash": TEST_HASH, "role": "superuser"
-        })];
-        for (name, role) in &self.extra_users {
-            users.push(serde_json::json!({
-                "username": name, "password_hash": TEST_HASH, "role": role
-            }));
-        }
         serde_json::json!({
             "version": 1,
             "upstream": {
                 "base_url": upstream,
                 "upstreams": self.upstreams,
                 "nim_keys": self.nim_keys.iter().map(|(k, rpm)| serde_json::json!({
-                    "key": k, "owner": TEST_USER, "enabled": true, "rpm": rpm
-                })).collect::<Vec<_>>(),
-            },
-            "client_auth": {
-                "mode": if self.open { "open" } else { "keyed" },
-                "keys": self.clients.iter().map(|(name, secret)| serde_json::json!({
-                    "name": name, "secret_sha256": sha256_hex(secret), "owner": TEST_USER
+                    "key": k, "enabled": true, "rpm": rpm
                 })).collect::<Vec<_>>(),
             },
             "limits": {
@@ -363,13 +315,6 @@ impl StoreOpts {
                 "request_timeout_secs": self.request_timeout_secs,
                 "max_inflight": self.max_inflight,
                 "strict_passthrough": self.strict_passthrough,
-                "backpressure_enabled": self.backpressure_enabled,
-                "backpressure_queue_threshold_eta_secs": self.backpressure_queue_threshold_eta_secs,
-            },
-            "users": users,
-            "cache": {
-                "ttl_secs": self.cache_ttl_secs,
-                "max_entries": self.cache_max_entries,
             },
         })
     }
@@ -457,15 +402,9 @@ pub async fn start_proxy_with(upstream: &str, opts: StoreOpts, envs: &[(&str, &s
     spawn_and_wait_healthy(data_dir, envs).await
 }
 
-/// Start the proxy with NO store: it must boot healthy in setup mode
-/// (claimably closed — /v1 answers 503, browsers land on /setup).
-pub async fn start_proxy_fresh() -> Proxy {
-    spawn_and_wait_healthy(fresh_data_dir(), &[]).await
-}
-
 /// Boot the proxy against a pre-populated DATA_DIR and wait until healthy —
 /// for hand-written recovery fixtures whose exact shape `StoreOpts` can't
-/// express (e.g. orphan-owned keys with no users).
+/// express (e.g. keys with odd rpm or disabled state).
 pub async fn start_proxy_in(data_dir: std::path::PathBuf, envs: &[(&str, &str)]) -> Proxy {
     spawn_and_wait_healthy(data_dir, envs).await
 }
@@ -573,77 +512,16 @@ pub fn scratch_data_dir() -> std::path::PathBuf {
     fresh_data_dir()
 }
 
-/// Log in as `username` (TEST_PASSWORD) and return the session cookie value.
-pub async fn login_as(proxy: &Proxy, username: &str) -> String {
-    let resp = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap()
-        .post(proxy.url("/login"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(format!("username={username}&password={TEST_PASSWORD}"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 303, "login should succeed for {username}");
-    let cookie = resp
-        .headers()
-        .get("set-cookie")
-        .expect("session cookie")
-        .to_str()
-        .unwrap();
-    cookie.split(';').next().unwrap().to_owned()
-}
-
-/// Session cookie for the default superuser.
-pub async fn login(proxy: &Proxy) -> String {
-    login_as(proxy, TEST_USER).await
-}
-
-/// Fetch /metrics authenticated with scraper-style header credentials.
+/// Fetch /metrics (open to the local operator — no credentials needed).
 pub async fn metrics(proxy: &Proxy) -> String {
     reqwest::Client::new()
         .get(proxy.url("/metrics"))
-        .header(
-            "authorization",
-            format!("Bearer {TEST_USER}:{TEST_PASSWORD}"),
-        )
         .send()
         .await
         .unwrap()
         .text()
         .await
         .unwrap()
-}
-
-/// Drive the setup wizard's single POST; returns the session cookie it mints.
-pub async fn complete_setup(
-    proxy: &Proxy,
-    username: &str,
-    password: &str,
-    base_url: &str,
-    nim_keys: &[(&str, usize)],
-) -> String {
-    let body = serde_json::json!({
-        "username": username,
-        "password": password,
-        "base_url": base_url,
-        "nim_keys": nim_keys.iter().map(|(k, rpm)| serde_json::json!({"key": k, "rpm": rpm})).collect::<Vec<_>>(),
-    });
-    let resp = reqwest::Client::new()
-        .post(proxy.url("/setup"))
-        .json(&body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200, "setup should succeed");
-    let cookie = resp
-        .headers()
-        .get("set-cookie")
-        .expect("setup mints a session")
-        .to_str()
-        .unwrap();
-    cookie.split(';').next().unwrap().to_owned()
 }
 
 /// Read an SSE response to completion (until [DONE], an error event, or EOF);

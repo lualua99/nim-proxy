@@ -9,12 +9,10 @@ saw a failure or the upstream recorded a single rate-limit violation.
 Typical run (three terminals or backgrounded):
   python3 scripts/mock_nim.py --enforce --rpm 40 --port 9999
   PORT=8000 DATA_DIR=/tmp/loadtest-data cargo run --release
-  # then claim it (config lives in the store, not env):
-  curl -X POST localhost:8000/setup -H 'content-type: application/json' -d \
-    '{"username":"op","password":"loadtest-pw-1","base_url":"http://127.0.0.1:9999",
-      "nim_keys":[{"key":"k1"},{"key":"k2"},{"key":"k3"}]}'
-  # open /v1 (Settings -> API access mode, or POST /api/settings/clients
-  # {"mode":"open"} with the session cookie), then:
+  # then write the store (single-user local build — no auth, no wizard):
+  curl -X POST localhost:8000/api/settings/nim-keys \
+    -H 'content-type: application/json' \
+    -d '{"add":{"key":"k1","rpm":40}}'      # repeat for k2, k3
   python3 scripts/loadtest.py --proxy http://127.0.0.1:8000 \
       --mock http://127.0.0.1:9999 --clients 100 --requests 3
 

@@ -98,5 +98,13 @@ three specifics:
   credentials live in the store, hashed. Prometheus scrapers authenticate with
   `Authorization: Bearer <username>:<password>` (or HTTP Basic), verified once
   against the store then memoized via HMAC (no 600k-iteration PBKDF2 per
-  scrape). The per-boot signing key and per-process login throttle are
-  unchanged.
+scrape). The per-boot signing key and per-process login throttle are
+   unchanged.
+
+## Retired (v0.7.0 — single-operator local build)
+
+The entire auth plane is **removed**: there are no users, roles, passwords,
+sessions, client keys, open/keyed mode, or wizard. `/v1`, the dashboard, and
+`/metrics` are open; trust lives solely in the bind address (loopback by
+default). See [single-user-local-build](single-user-local-build.md). This page
+now documents only the pre-v0.7.0 multi-user builds.

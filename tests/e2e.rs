@@ -1,42 +1,30 @@
 //! End-to-end tests: the real proxy binary against a scriptable mock NIM.
 //!
 //! Config now lives in a UI-managed store (DATA_DIR/config.json) rather than
-//! env vars: `StoreOpts` writes the fixture, and the dashboard/metrics/history
-//! surface always requires auth. See `tests/support/mod.rs` for the harness.
+//! env vars: `StoreOpts` writes the fixture. There is no auth — /v1 and the
+//! dashboard surface are open to the local operator. See
+//! `tests/support/mod.rs` for the harness.
 
 mod support;
 
-use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::http::header;
 use futures_util::StreamExt;
 use support::{
-    chat_body, complete_setup, expect_refuses_to_start, login, login_as, metrics, read_sse,
-    restart, scratch_data_dir, start_mock, start_proxy, start_proxy_fresh, start_proxy_in,
-    start_proxy_with, Behavior, StoreOpts, TEST_PASSWORD,
+    chat_body, expect_refuses_to_start, metrics, read_sse, restart, scratch_data_dir, start_mock,
+    start_proxy, start_proxy_in, start_proxy_with, Behavior, StoreOpts,
 };
 
 fn client() -> reqwest::Client {
     reqwest::Client::new()
 }
 
-/// A client that does NOT follow redirects, so we can assert on 302/303.
-fn no_redirect_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap()
-}
-
-/// A keyed-`/v1` fixture: one client key (name, secret), otherwise defaults.
-fn keyed(name: &str, secret: &str) -> StoreOpts {
-    StoreOpts {
-        open: false,
-        clients: vec![(name.into(), secret.into())],
-        ..Default::default()
-    }
+/// Session cookies no longer exist: dashboard endpoints are open. A handful
+/// of tests still thread a "cookie" through helpers for readability — produce
+/// a harmless value so signatures stay stable.
+async fn session_cookie(_proxy: &support::Proxy) -> String {
+    "local-session".to_owned()
 }
 
 async fn send_successful_chats(proxy: &support::Proxy, count: usize) {
@@ -131,63 +119,13 @@ async fn open_mode_admits_requests_without_a_client_key() {
     let v: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(v["choices"][0]["message"]["content"], "hello world");
 }
-
 #[tokio::test]
-async fn keyed_mode_rejects_bad_tokens_and_accepts_good_ones() {
+async fn deadline_header_validation_runs_before_upstream() {
     let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, keyed("alice", "sekrit"), &[]).await;
-
-    let missing = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("hi", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(missing.status(), 401);
-    let body: serde_json::Value = missing.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "unauthorized");
-
-    let wrong = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .bearer_auth("nope")
-        .json(&chat_body("hi", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(wrong.status(), 401);
-
-    let ok = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .bearer_auth("sekrit")
-        .json(&chat_body("hi", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(ok.status(), 200);
-    assert_eq!(
-        mock.state.hit_count(),
-        1,
-        "only the authorized call reached upstream"
-    );
-}
-
-#[tokio::test]
-async fn deadline_header_validation_runs_after_auth_and_before_upstream() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, keyed("alice", "sekrit"), &[]).await;
-
-    let unauthorized = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .header("x-nim-proxy-deadline-ms", "not-a-number")
-        .json(&chat_body("unauthorized", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(unauthorized.status(), 401, "auth fails before validation");
+    let proxy = start_proxy(&mock.url, &[]).await;
 
     let malformed = client()
         .post(proxy.url("/v1/chat/completions"))
-        .bearer_auth("sekrit")
         .header("x-nim-proxy-deadline-ms", "10.0")
         .json(&chat_body("malformed", false))
         .send()
@@ -199,7 +137,6 @@ async fn deadline_header_validation_runs_after_auth_and_before_upstream() {
 
     let duplicate = client()
         .post(proxy.url("/v1/chat/completions"))
-        .bearer_auth("sekrit")
         .header("x-nim-proxy-deadline-ms", "100")
         .header("x-nim-proxy-deadline-ms", "200")
         .json(&chat_body("duplicate", false))
@@ -535,6 +472,161 @@ async fn saturation_fails_fast_with_504() {
     );
 }
 
+/// A one-seat, 1-rpm pool: the first (completed) request consumes the whole
+/// 60s window, so every later request queues in `waiting_slot`. `max_wait`
+/// must exceed the ~60s window wait — otherwise the dispatcher fails the
+/// waiter fast (its deadline would lapse before any slot) instead of parking
+/// it where we can observe (and abandon) it.
+fn single_seat() -> StoreOpts {
+    StoreOpts {
+        nim_keys: vec![("only-key".into(), 1)],
+        max_wait_secs: 120,
+        ..Default::default()
+    }
+}
+
+async fn queue_rows(proxy: &support::Proxy, cookie: &str) -> Vec<serde_json::Value> {
+    client()
+        .get(proxy.url("/api/queue"))
+        .header("cookie", cookie)
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["requests"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+/// Wait (bounded) for a queued request to reach `phase`; returns its id.
+async fn wait_for_phase(proxy: &support::Proxy, cookie: &str, phase: &str) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(r) = queue_rows(proxy, cookie)
+            .await
+            .into_iter()
+            .find(|r| r["phase"] == phase)
+        {
+            return r["id"].as_u64().unwrap();
+        }
+        assert!(Instant::now() < deadline, "request never reached {phase}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// True when `id` leaves the queue within `budget`; false if it lingers.
+async fn wait_gone(proxy: &support::Proxy, cookie: &str, id: u64, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        let present = queue_rows(proxy, cookie)
+            .await
+            .iter()
+            .any(|r| r["id"].as_u64() == Some(id));
+        if !present {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A streaming request parked in the slot queue vanishes from the operator
+/// queue the moment its client hangs up — not at the next heartbeat tick.
+/// Otherwise the abandoned row would linger next to the harness's re-issued
+/// retry, which the queue view renders as two entries for one logical request
+/// (and the ghost would still wait for — and burn — an rpm slot).
+#[tokio::test]
+async fn abandoned_streaming_waiter_unregisters_before_the_heartbeat() {
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(
+        &mock.url,
+        StoreOpts {
+            heartbeat_secs: 3, // a full heartbeat tick used to be needed
+            ..single_seat()
+        },
+        &[],
+    )
+    .await;
+    let cookie = session_cookie(&proxy).await;
+
+    // 1-rpm single seat: this completes, taking the whole 60s window.
+    let first = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("first", true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    assert!(read_sse(first).await.contains("data: [DONE]"));
+    assert_eq!(mock.state.hit_count(), 1);
+
+    // Second client parks in the queue, then hangs up hard.
+    let waiter = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("abandoned", true))
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream();
+    let waiter_id = wait_for_phase(&proxy, &cookie, "waiting_slot").await;
+    drop(waiter);
+
+    assert!(
+        wait_gone(&proxy, &cookie, waiter_id, Duration::from_secs(2)).await,
+        "abandoned waiter lingered past 2s (heartbeat is 3s); a hang-up must reap immediately"
+    );
+
+    // And the ghost must never have reached the upstream: an abandoned request
+    // ahead of its slot burns the scarce rpm budget the pile-up is about.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        mock.state.hit_count(),
+        1,
+        "only the completed request reached the upstream; the abandoned waiter must not"
+    );
+}
+
+/// A buffered request (no SSE heartbeats, no in-band disconnect signal) must
+/// still release its queue row when the client hangs up while waiting for a
+/// slot — stale entries would linger until `max_wait` (120s here, well past
+/// the 60s window wait it sits out).
+#[tokio::test]
+async fn abandoned_buffered_waiter_unregisters() {
+    let mock = start_mock().await;
+    let proxy = start_proxy_with(&mock.url, single_seat(), &[]).await;
+    let cookie = session_cookie(&proxy).await;
+
+    let first = client()
+        .post(proxy.url("/v1/chat/completions"))
+        .json(&chat_body("first", true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    assert!(read_sse(first).await.contains("data: [DONE]"));
+
+    let waiter_url = proxy.url("/v1/chat/completions");
+    let waiter = tokio::spawn(async move {
+        client()
+            .post(waiter_url)
+            .json(&chat_body("abandoned", false))
+            .send()
+            .await
+            .ok()
+    });
+    let waiter_id = wait_for_phase(&proxy, &cookie, "waiting_slot").await;
+    waiter.abort(); // hang up while it waits
+
+    assert!(
+        wait_gone(&proxy, &cookie, waiter_id, Duration::from_secs(5)).await,
+        "abandoned buffered waiter lingered past 5s (max_wait is 120s)"
+    );
+}
+
 #[tokio::test]
 async fn conversation_affinity_pins_a_conversation_to_one_key() {
     let mock = start_mock().await;
@@ -570,20 +662,12 @@ async fn conversation_affinity_pins_a_conversation_to_one_key() {
 }
 
 #[tokio::test]
-async fn models_catalog_is_cached_and_auth_gated() {
+async fn models_catalog_is_cached() {
     let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, keyed("alice", "sekrit"), &[]).await;
-
-    let unauth = client().get(proxy.url("/v1/models")).send().await.unwrap();
-    assert_eq!(unauth.status(), 401);
+    let proxy = start_proxy(&mock.url, &[]).await;
 
     for _ in 0..3 {
-        let r = client()
-            .get(proxy.url("/v1/models"))
-            .bearer_auth("sekrit")
-            .send()
-            .await
-            .unwrap();
+        let r = client().get(proxy.url("/v1/models")).send().await.unwrap();
         assert_eq!(r.status(), 200);
         let v: serde_json::Value = r.json().await.unwrap();
         assert_eq!(v["data"][0]["id"], "mock/model-a");
@@ -598,15 +682,11 @@ async fn models_catalog_is_cached_and_auth_gated() {
 }
 
 #[tokio::test]
-async fn api_models_requires_login_and_rides_the_shared_catalog_cache() {
+async fn api_models_rides_the_shared_catalog_cache() {
     let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, keyed("alice", "sekrit"), &[]).await;
+    let proxy = start_proxy(&mock.url, &[]).await;
 
-    // Dashboard session gate: no cookie -> 401 like every other /api route.
-    let unauth = client().get(proxy.url("/api/models")).send().await.unwrap();
-    assert_eq!(unauth.status(), 401);
-
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
     let get = || {
         client()
             .get(proxy.url("/api/models"))
@@ -651,12 +731,7 @@ async fn api_models_requires_login_and_rides_the_shared_catalog_cache() {
 
     // The dashboard's catalog write lands in the shared cache: the client-
     // facing /v1/models now answers from it without a new upstream fetch.
-    let rv1 = client()
-        .get(proxy.url("/v1/models"))
-        .bearer_auth("sekrit")
-        .send()
-        .await
-        .unwrap();
+    let rv1 = client().get(proxy.url("/v1/models")).send().await.unwrap();
     assert_eq!(rv1.status(), 200);
     assert_eq!(
         mock.state
@@ -771,11 +846,10 @@ async fn stalled_upstream_stream_errors_out_within_idle_timeout() {
 #[tokio::test]
 async fn metrics_report_traffic_tokens_and_affinity() {
     let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, keyed("alice", "sekrit"), &[]).await;
+    let proxy = start_proxy(&mock.url, &[]).await;
 
     let resp = client()
         .post(proxy.url("/v1/chat/completions"))
-        .bearer_auth("sekrit")
         .json(&chat_body("hi", true))
         .send()
         .await
@@ -784,10 +858,10 @@ async fn metrics_report_traffic_tokens_and_affinity() {
 
     let metrics = metrics(&proxy).await;
     assert!(metrics.contains(r#"nimproxy_requests_total{"#), "{metrics}");
-    assert!(metrics.contains(r#"client="alice""#));
+    assert!(metrics.contains(r#"client="local""#));
     assert!(metrics.contains(r#"model="mock/model-a""#));
     assert!(
-        metrics.contains(r#"nimproxy_completion_tokens_total{client="alice",model="mock/model-a",source="usage"} 2"#),
+        metrics.contains(r#"nimproxy_completion_tokens_total{client="local",model="mock/model-a",source="usage"} 2"#),
         "exact usage counted: {metrics}"
     );
     assert!(metrics.contains("nimproxy_affinity_total"));
@@ -981,61 +1055,6 @@ async fn buffered_quality_and_edge_cases_are_recorded() {
 
 // ---------- correctness & security hardening (PR 6a) ----------
 
-/// A malformed percent-escape with a multibyte char (`%€`) in the login body
-/// must not panic the pre-auth handler (it used to slice a &str on a non-char
-/// boundary). The request should come back as a normal failed-login page.
-#[tokio::test]
-async fn login_handles_malformed_urlencoded_without_panic() {
-    let mock = start_mock().await;
-    let proxy = start_proxy(&mock.url, &[]).await;
-
-    let resp = client()
-        .post(proxy.url("/login"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body("username=root&password=%a\u{20ac}")
-        .send()
-        .await
-        .unwrap();
-    // No panic / connection reset: a clean 401 login page with the error.
-    assert_eq!(resp.status(), 401);
-    assert!(resp
-        .text()
-        .await
-        .unwrap()
-        .contains("Incorrect username or password"));
-}
-
-/// Repeated failed logins trip the throttle: a burst past the failure cap
-/// returns 429 + Retry-After, even for a subsequently-correct password.
-#[tokio::test]
-async fn login_throttles_after_repeated_failures() {
-    let mock = start_mock().await;
-    let proxy = start_proxy(&mock.url, &[]).await;
-
-    // The cap is 10 failures per window; 11 wrong attempts trips it. Every
-    // attempt names a real user so the throttle (not a parse path) is what fires.
-    for _ in 0..11 {
-        let r = client()
-            .post(proxy.url("/login"))
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body("username=root&password=wrong")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 401); // wrong password re-renders the form (401)
-    }
-    // Now throttled: even the correct password is refused with 429 + Retry-After.
-    let r = client()
-        .post(proxy.url("/login"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(format!("username=root&password={TEST_PASSWORD}"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 429);
-    assert_eq!(r.headers().get("retry-after").unwrap(), "60");
-}
-
 /// A buffered request against an upstream that sends headers then stalls the
 /// body must not hang forever holding an in-flight slot — the request timeout
 /// surfaces a gateway error instead.
@@ -1195,7 +1214,7 @@ async fn history_records_snapshots_and_survives_restart() {
     // Restart on the SAME data dir: history reloads into the normalized index
     // and remains visible through the typed dashboard range contract.
     let proxy = restart(proxy, &[("HISTORY_SAMPLE_SECS", "1")]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
     let history: serde_json::Value = client()
         .get(proxy.url("/api/dashboard?from=1&to=4102444800&points=1000"))
         .header("cookie", cookie)
@@ -1215,7 +1234,7 @@ async fn history_records_snapshots_and_survives_restart() {
 async fn dashboard_history_combines_process_epochs() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[("HISTORY_SAMPLE_SECS", "1")]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
     let initial = dashboard_range(&proxy, &cookie, 1, 4_102_444_800, 1000).await;
 
     send_successful_chats(&proxy, 2).await;
@@ -1228,7 +1247,7 @@ async fn dashboard_history_combines_process_epochs() {
     .await;
 
     let proxy = restart(proxy, &[("HISTORY_SAMPLE_SECS", "1")]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
     let second_epoch = dashboard_range(&proxy, &cookie, 1, 4_102_444_800, 1000).await;
     assert_eq!(successful_chat_requests(&second_epoch["totals"]), 2.0);
 
@@ -1255,7 +1274,7 @@ async fn dashboard_history_combines_process_epochs() {
 async fn dashboard_tail_rolls_into_persisted_history_once() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[("HISTORY_SAMPLE_SECS", "2")]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
     let initial = dashboard_range(&proxy, &cookie, 1, 4_102_444_800, 1000).await;
 
     send_successful_chats(&proxy, 1).await;
@@ -1323,7 +1342,7 @@ async fn legacy_history_infers_counter_reset() {
     .unwrap();
 
     let proxy = start_proxy_in(data_dir, &[("HISTORY_SAMPLE_SECS", "3600")]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
     let range = dashboard_range(&proxy, &cookie, 1, 4_102_444_800, 1000).await;
     assert_eq!(
         successful_chat_requests(&range["totals"]),
@@ -1337,7 +1356,7 @@ async fn legacy_history_infers_counter_reset() {
 async fn historical_capacity_uses_snapshot_configuration() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[("HISTORY_SAMPLE_SECS", "1")]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
     let initial = dashboard_range(&proxy, &cookie, 1, 4_102_444_800, 1000).await;
 
     send_successful_chats(&proxy, 1).await;
@@ -1395,10 +1414,10 @@ async fn historical_capacity_uses_snapshot_configuration() {
 }
 
 #[tokio::test]
-async fn dashboard_range_contract_defaults_validates_and_requires_auth() {
+async fn dashboard_range_contract_defaults_and_validates() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[("HISTORY_SAMPLE_SECS", "1")]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
 
     let response = client()
         .post(proxy.url("/v1/chat/completions"))
@@ -1457,7 +1476,7 @@ async fn dashboard_range_contract_defaults_validates_and_requires_auth() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 401);
+    assert_eq!(response.status(), 200);
 
     let settings = api_config(&proxy, &cookie).await;
     assert!(settings["server"]["history"]["available_from"]
@@ -1473,7 +1492,7 @@ async fn dashboard_range_contract_defaults_validates_and_requires_auth() {
 async fn dashboard_now_contract_uses_current_pool_config_and_registry() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
 
     let response = client()
         .get(proxy.url("/api/dashboard/now"))
@@ -1510,20 +1529,13 @@ async fn dashboard_now_contract_uses_current_pool_config_and_registry() {
     }
     assert_eq!(body["window_fill"], 0);
     assert_eq!(body["window_capacity"], 120);
-
-    let response = client()
-        .get(proxy.url("/api/dashboard/now"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 401);
 }
 
 #[tokio::test]
 async fn dashboard_now_window_fill_reflects_real_count_not_rate_extrapolation() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
 
     // Before any requests: empty window.
     let before = dashboard_now(&proxy, &cookie).await;
@@ -1554,97 +1566,10 @@ async fn dashboard_now_window_fill_reflects_real_count_not_rate_extrapolation() 
 }
 
 #[tokio::test]
-async fn dashboard_capacity_model_contract_requires_auth_and_returns_aggregates() {
-    let mock = start_mock().await;
-    let proxy = start_proxy(&mock.url, &[]).await;
-    let cookie = login(&proxy).await;
-
-    // Requires session.
-    let noauth = client()
-        .get(proxy.url("/api/dashboard/capacity-model"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(noauth.status(), 401);
-
-    // Returns 200 + expected structure.
-    let response = client()
-        .get(proxy.url("/api/dashboard/capacity-model"))
-        .header("cookie", &cookie)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    let body: serde_json::Value = response.json().await.unwrap();
-
-    assert!(body["sampled_at"].as_u64().is_some(), "sampled_at");
-    assert_eq!(body["window_seconds"], 3600);
-
-    // per_key
-    let pk = &body["per_key"];
-    assert!(pk["rpm"].is_array(), "rpm array");
-    assert!(pk["calibration"].is_array(), "calibration array");
-    assert!(pk["effective_rpm"].is_array(), "effective_rpm array");
-    assert!(pk["capacity_rpm"].as_u64().is_some(), "capacity_rpm");
-
-    // per_client
-    let pc = &body["per_client"];
-    assert!(pc["count"].as_u64().is_some(), "client count");
-    assert!(
-        pc["total_requests"].is_null() || pc["total_requests"].as_f64().is_some(),
-        "total_requests"
-    );
-    assert!(
-        pc["observed_rpm"].is_null() || pc["observed_rpm"].as_f64().is_some(),
-        "observed_rpm"
-    );
-
-    // per_model
-    let pm = &body["per_model"];
-    assert!(pm["caps"].is_array(), "model caps array");
-    assert!(pm["overrides"].is_object(), "overrides object");
-
-    // history_sample
-    let hs = &body["history_sample"];
-    assert!(hs["queue_wait_p50"].is_null() || hs["queue_wait_p50"].as_f64().is_some());
-    assert!(hs["queue_wait_p95"].is_null() || hs["queue_wait_p95"].as_f64().is_some());
-    assert!(
-        hs["upstream_seconds_mean"].is_null() || hs["upstream_seconds_mean"].as_f64().is_some(),
-        "upstream_seconds_mean"
-    );
-    assert!(
-        hs["tokens_per_second_mean"].is_null() || hs["tokens_per_second_mean"].as_f64().is_some(),
-        "tokens_per_second_mean"
-    );
-    assert!(hs["ttft_p50"].is_null() || hs["ttft_p50"].as_f64().is_some());
-    assert!(
-        hs["requests_per_min"].is_null() || hs["requests_per_min"].as_f64().is_some(),
-        "requests_per_min"
-    );
-
-    // Default pool: 3 lanes × 40 rpm = 120 capacity.
-    assert_eq!(pk["capacity_rpm"], 120);
-    assert_eq!(pk["rpm"], serde_json::json!([40, 40, 40]));
-}
-
-#[tokio::test]
-async fn dashboard_sse_stream_requires_auth() {
-    let mock = start_mock().await;
-    let proxy = start_proxy(&mock.url, &[]).await;
-
-    let response = client()
-        .get(proxy.url("/api/dashboard/stream"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 401);
-}
-
-#[tokio::test]
 async fn dashboard_sse_stream_returns_event_stream() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
 
     let response = client()
         .get(proxy.url("/api/dashboard/stream"))
@@ -1689,7 +1614,7 @@ async fn read_first_sse_json(resp: reqwest::Response) -> String {
 async fn dashboard_sse_stream_receives_data_within_timeout() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
 
     let response = client()
         .get(proxy.url("/api/dashboard/stream"))
@@ -1719,7 +1644,7 @@ async fn dashboard_sse_stream_receives_data_within_timeout() {
 async fn dashboard_sse_stream_connection_limit_returns_503() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
 
     // Open enough concurrent SSE connections to exhaust the limit (100) and
     // verify the next one is rejected with 503. Each response body is held
@@ -1780,7 +1705,7 @@ async fn retention_change_prunes_queries_and_disk() {
     .unwrap();
 
     let proxy = start_proxy_in(data_dir, &[("HISTORY_SAMPLE_SECS", "3600")]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
     let (status, body) = post_json(
         &proxy,
         &cookie,
@@ -1833,7 +1758,7 @@ async fn retention_change_prunes_queries_and_disk() {
     }
 
     let proxy = restart(proxy, &[("HISTORY_SAMPLE_SECS", "3600")]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
     let reloaded = query(&proxy, &cookie).await;
     assert_eq!(reloaded["window"]["available_from"], retained_one);
     assert_eq!(metric(&reloaded), 20.0);
@@ -1848,10 +1773,10 @@ async fn sigterm_shuts_down_cleanly() {
 }
 
 #[tokio::test]
-async fn dashboard_and_config_are_served_to_authenticated_users() {
+async fn dashboard_and_config_are_served_to_anyone() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
 
     let dash = client()
         .get(proxy.url("/"))
@@ -1879,7 +1804,10 @@ async fn dashboard_and_config_are_served_to_authenticated_users() {
         .await
         .unwrap();
     assert_eq!(now["lanes"], 3);
-    assert_eq!(now["auth"], false, "open /v1 mode reports auth=false");
+    assert!(
+        !now.as_object().unwrap().contains_key("auth"),
+        "no client-auth plane in the now payload"
+    );
 
     for retired in ["/api/history", "/dash/config.json"] {
         assert_eq!(
@@ -1900,7 +1828,7 @@ async fn dashboard_and_config_are_served_to_authenticated_users() {
 async fn dashboard_history_settings_markup() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
 
     let html = client()
         .get(proxy.url("/"))
@@ -1924,7 +1852,7 @@ async fn dashboard_history_settings_markup() {
 async fn dashboard_range_state_guards_markup() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
 
     let html = client()
         .get(proxy.url("/"))
@@ -1949,7 +1877,7 @@ async fn dashboard_range_state_guards_markup() {
 async fn dashboard_pause_traffic_is_derived_from_rendered_samples() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
 
     let html = client()
         .get(proxy.url("/"))
@@ -1973,7 +1901,7 @@ async fn dashboard_pause_traffic_is_derived_from_rendered_samples() {
 async fn dashboard_historical_provisioning_has_no_guessed_lane_size() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
 
     let html = client()
         .get(proxy.url("/"))
@@ -1995,7 +1923,7 @@ async fn dashboard_historical_provisioning_has_no_guessed_lane_size() {
 async fn dashboard_now_refreshes_after_settings_change() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
 
     let before: serde_json::Value = client()
         .get(proxy.url("/api/dashboard/now"))
@@ -2038,58 +1966,10 @@ async fn dashboard_now_refreshes_after_settings_change() {
     );
 }
 
-// ---------- boot posture & the setup wizard ----------
-
-/// With no store, the proxy boots healthy but claimably closed: /v1 answers
-/// 503 setup_required, browsers land on /setup, and /setup serves the wizard.
-#[tokio::test]
-async fn fresh_boot_enters_setup_mode() {
-    let proxy = start_proxy_fresh().await;
-    let nr = no_redirect_client();
-
-    // Health stays public so orchestrators can probe a not-yet-claimed proxy.
-    assert_eq!(
-        client()
-            .get(proxy.url("/health"))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        200
-    );
-
-    // /v1 is closed until setup completes.
-    let api = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("hi", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(api.status(), 503);
-    let body: serde_json::Value = api.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "setup_required");
-
-    // Browsers are steered to the wizard, from both the dashboard and /login.
-    let dash = nr
-        .get(proxy.url("/"))
-        .header("accept", "text/html")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(dash.status(), 302);
-    assert_eq!(dash.headers()["location"], "/setup");
-
-    let login = nr.get(proxy.url("/login")).send().await.unwrap();
-    assert_eq!(login.status(), 302);
-    assert_eq!(login.headers()["location"], "/setup");
-
-    let setup = client().get(proxy.url("/setup")).send().await.unwrap();
-    assert_eq!(setup.status(), 200);
-    assert!(setup.text().await.unwrap().contains("setup"));
-}
+// ---------- boot posture & the store ----------
 
 /// A corrupt or future-version store is a hard boot error, never a silent
-/// fall-through to setup mode (which would discard credentials and keys).
+/// fall-through to defaults (which would discard configured keys).
 #[tokio::test]
 async fn corrupt_or_future_store_refuses_to_start() {
     let corrupt = scratch_data_dir();
@@ -2101,304 +1981,9 @@ async fn corrupt_or_future_store_refuses_to_start() {
     expect_refuses_to_start(future).await;
 }
 
-/// The wizard's single POST claims the proxy: creates the superuser, writes a
-/// 0600 store, mints a session, closes /setup (404), and opens /v1.
-#[tokio::test]
-async fn setup_wizard_claims_the_proxy() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_fresh().await;
-
-    complete_setup(
-        &proxy,
-        "admin",
-        "hunter2hunter2",
-        &mock.url,
-        &[("nvapi-key", 40)],
-    )
-    .await;
-
-    // Credentials file is owner-only.
-    let mode = std::fs::metadata(proxy.data_dir.join("config.json"))
-        .unwrap()
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(mode, 0o600, "config store must be 0600");
-
-    // The wizard is gone once the proxy is claimed.
-    assert_eq!(
-        client()
-            .get(proxy.url("/setup"))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        404
-    );
-    let post_setup = client()
-        .post(proxy.url("/setup"))
-        .json(&serde_json::json!({"username": "x", "password": "yyyyyyyyyy"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(post_setup.status(), 404, "POST /setup 404 after claim");
-    let post_validate = client()
-        .post(proxy.url("/setup/validate-key"))
-        .json(&serde_json::json!({"key": "k"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        post_validate.status(),
-        404,
-        "POST /setup/validate-key 404 after claim"
-    );
-
-    // The /v1 setup gate has lifted: it no longer answers 503 setup_required.
-    // A wizard-created store is keyed (see setup.html: "create client keys in
-    // Settings"), so with no client key yet it fails closed with 401.
-    let r = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("hi", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 401, "keyed /v1 with no client key fails closed");
-    let v: serde_json::Value = r.json().await.unwrap();
-    assert_eq!(v["error"]["code"], "unauthorized");
-}
-
-/// The claim persists: after a restart on the same data dir, the created user
-/// can log in and the setup-provided key is still in the pool.
-#[tokio::test]
-async fn setup_claim_survives_restart() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_fresh().await;
-    // TEST_PASSWORD so `login_as` (which uses it) works after the restart.
-    complete_setup(
-        &proxy,
-        "admin",
-        TEST_PASSWORD,
-        &mock.url,
-        &[("nvapi-key", 40)],
-    )
-    .await;
-
-    let proxy = restart(proxy, &[]).await;
-
-    // Session auth works against the persisted user.
-    let cookie = login_as(&proxy, "admin").await;
-    // The persisted store rehydrated: one lane (the setup key), keyed /v1.
-    let cfg: serde_json::Value = client()
-        .get(proxy.url("/api/dashboard/now"))
-        .header("cookie", cookie)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(cfg["lanes"], 1, "setup key survived the restart");
-    assert_eq!(cfg["auth"], true, "keyed /v1 mode persisted");
-
-    // /v1 is live behind auth (not the pre-setup 503).
-    let r = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("hi", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 401, "keyed /v1 fails closed, no longer 503");
-}
-
-/// Lockout recovery: a store whose users were hand-emptied on the volume (its
-/// keys left with dangling owners) boots into setup mode; the new superuser
-/// adopts the orphan keys, so /v1 works without re-supplying them.
-#[tokio::test]
-async fn recovery_store_adopts_orphan_keys() {
-    let mock = start_mock().await;
-    let dir = scratch_data_dir();
-    let fixture = serde_json::json!({
-        "version": 1,
-        "upstream": {
-            "base_url": mock.url,
-            "nim_keys": [{"key": "orphan-key", "owner": "ghost", "enabled": true, "rpm": 40}],
-        },
-        // Open /v1 so the test can observe the adopted key reaching upstream
-        // (a wizard-created store would be keyed; this recovery store predates it).
-        "client_auth": {"mode": "open"},
-        "users": [],
-    });
-    std::fs::write(
-        dir.join("config.json"),
-        serde_json::to_string_pretty(&fixture).unwrap(),
-    )
-    .unwrap();
-
-    let proxy = start_proxy_in(dir, &[]).await;
-    // No superuser -> setup mode despite the store existing.
-    assert_eq!(
-        client()
-            .get(proxy.url("/setup"))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        200
-    );
-
-    // Claim with an empty key list: the orphan is re-owned by the superuser.
-    complete_setup(&proxy, "admin", TEST_PASSWORD, &mock.url, &[]).await;
-
-    let r = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("hi", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 200, "adopted key serves /v1");
-    assert_eq!(mock.state.hit_keys(), vec!["orphan-key".to_owned()]);
-}
-
-/// The wizard rejects a password shorter than 10 characters up front.
-#[tokio::test]
-async fn setup_rejects_weak_password() {
-    let proxy = start_proxy_fresh().await;
-    let resp = client()
-        .post(proxy.url("/setup"))
-        .json(&serde_json::json!({
-            "username": "admin", "password": "short", "nim_keys": []
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 400);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "weak_password");
-}
-
-/// The wizard's pre-auth key probe reports how many models an upstream key can
-/// see (the mock exposes exactly one).
-#[tokio::test]
-async fn setup_validate_key_probes_upstream() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_fresh().await;
-    let resp = client()
-        .post(proxy.url("/setup/validate-key"))
-        .json(&serde_json::json!({"key": "nvapi-probe", "base_url": mock.url}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["ok"], true, "{body}");
-    assert_eq!(body["models"], 1, "{body}");
-}
-
 // ---------- security hardening ----------
 
-/// Post-setup, the operator surface (dashboard, metrics, history) always
-/// requires auth — there is no insecure mode. Health stays public.
-#[tokio::test]
-async fn operator_surface_always_requires_auth() {
-    let mock = start_mock().await;
-    let proxy = start_proxy(&mock.url, &[]).await;
-
-    // Health stays public (load balancers / Docker probe).
-    assert_eq!(
-        client()
-            .get(proxy.url("/health"))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        200
-    );
-
-    // Metrics require creds; Bearer <user>:<pass> works (Prometheus scrape path).
-    assert_eq!(
-        client()
-            .get(proxy.url("/metrics"))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        401
-    );
-    let ok = client()
-        .get(proxy.url("/metrics"))
-        .header(
-            "authorization",
-            format!("Bearer {}:{TEST_PASSWORD}", support::TEST_USER),
-        )
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(ok.status(), 200);
-
-    // Both dashboard data surfaces require credentials.
-    for path in ["/api/dashboard", "/api/dashboard/now"] {
-        assert_eq!(
-            client().get(proxy.url(path)).send().await.unwrap().status(),
-            401,
-            "{path} requires auth"
-        );
-    }
-
-    // Browser hitting the dashboard without a session is redirected to /login.
-    let nr = no_redirect_client();
-    let redir = nr
-        .get(proxy.url("/"))
-        .header("accept", "text/html")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(redir.status(), 302);
-    assert_eq!(redir.headers()["location"], "/login");
-    assert_eq!(
-        nr.get(proxy.url("/login")).send().await.unwrap().status(),
-        200
-    );
-
-    // Wrong password is rejected; correct password sets a hardened session cookie.
-    let bad = nr
-        .post(proxy.url("/login"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body("username=root&password=wrong")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(bad.status(), 401);
-
-    let good = nr
-        .post(proxy.url("/login"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(format!(
-            "username={}&password={TEST_PASSWORD}",
-            support::TEST_USER
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(good.status(), 303);
-    let cookie = good.headers()["set-cookie"].to_str().unwrap().to_owned();
-    assert!(cookie.contains("nimproxy_session="));
-    assert!(cookie.contains("HttpOnly"));
-    assert!(cookie.contains("SameSite=Strict"));
-
-    // The session cookie then opens the dashboard.
-    let session = cookie.split(';').next().unwrap();
-    let dash = nr
-        .get(proxy.url("/"))
-        .header("accept", "text/html")
-        .header("cookie", session)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(dash.status(), 200);
-    assert!(dash.text().await.unwrap().contains("NIM"));
-}
-
+/// Health stays public.
 #[tokio::test]
 async fn model_label_is_sanitized_in_metrics() {
     let mock = start_mock().await;
@@ -2453,7 +2038,7 @@ async fn dashboard_sends_security_headers() {
     let proxy = start_proxy(&mock.url, &[]).await;
     // The dashboard now requires a session; assert the CSP on an authenticated
     // 200 (the hardening headers wrap every response, success or redirect).
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
     let resp = client()
         .get(proxy.url("/"))
         .header("cookie", cookie)
@@ -2550,7 +2135,7 @@ async fn worker_exhaustion_streaming_retries_inside_the_stream() {
 }
 
 // ---------------------------------------------------------------------------
-// Settings API: role filtering, ownership, invariants, live application.
+// Settings API: invariants and live application.
 // ---------------------------------------------------------------------------
 
 async fn api_config(proxy: &support::Proxy, cookie: &str) -> serde_json::Value {
@@ -2582,280 +2167,6 @@ async fn post_json(
     let v = resp.json().await.unwrap_or_default();
     (status, v)
 }
-
-#[tokio::test]
-async fn api_config_is_filtered_by_role_before_serialization() {
-    let mock = start_mock().await;
-    let opts = support::StoreOpts {
-        extra_users: vec![("alice".into(), "user".into())],
-        ..Default::default()
-    };
-    let proxy = start_proxy_with(&mock.url, opts, &[]).await;
-
-    // Admin view: server settings, users, and every key row (owner-labeled).
-    let root = support::login(&proxy).await;
-    let admin_view = api_config(&proxy, &root).await;
-    assert_eq!(admin_view["role"], "superuser");
-    assert!(admin_view["server"].is_object(), "{admin_view}");
-    assert_eq!(admin_view["users"].as_array().unwrap().len(), 2);
-    assert_eq!(admin_view["nim_keys"].as_array().unwrap().len(), 3);
-
-    // User view: the raw JSON body simply has no server/users sections and
-    // no foreign key rows — CSS tampering can reveal nothing.
-    let alice = support::login_as(&proxy, "alice").await;
-    let user_view = api_config(&proxy, &alice).await;
-    assert_eq!(user_view["role"], "user");
-    assert!(user_view.get("server").is_none(), "{user_view}");
-    assert!(user_view.get("users").is_none(), "{user_view}");
-    assert_eq!(
-        user_view["nim_keys"].as_array().unwrap().len(),
-        0,
-        "alice owns no keys and must not see root's: {user_view}"
-    );
-    // The pool aggregate stays visible to everyone.
-    assert_eq!(user_view["pool"]["enabled"], 3);
-}
-
-#[tokio::test]
-async fn user_role_is_denied_server_settings_and_foreign_keys() {
-    let mock = start_mock().await;
-    let opts = support::StoreOpts {
-        extra_users: vec![("alice".into(), "user".into())],
-        ..Default::default()
-    };
-    let proxy = start_proxy_with(&mock.url, opts, &[]).await;
-    let root = support::login(&proxy).await;
-    let alice = support::login_as(&proxy, "alice").await;
-
-    for (path, body) in [
-        (
-            "/api/settings/upstream",
-            serde_json::json!({"base_url": "http://x"}),
-        ),
-        (
-            "/api/settings/history",
-            serde_json::json!({
-                "days": 30,
-                "default_window_days": 30,
-                "slo_target_percent": 99.9
-            }),
-        ),
-        (
-            "/api/settings/users",
-            serde_json::json!({"add": {"username": "eve", "password": "long-enough-pw", "role": "user"}}),
-        ),
-        ("/api/settings/clients", serde_json::json!({"mode": "open"})),
-        (
-            "/api/settings/limits",
-            serde_json::json!({
-                "max_wait_secs": 60, "heartbeat_secs": 5, "models_ttl_secs": 600,
-                "stream_idle_secs": 300, "request_timeout_secs": 300,
-                "max_inflight": 512, "strict_passthrough": false,
-                "backpressure_enabled": false,
-                "backpressure_queue_threshold_eta_secs": 20
-            }),
-        ),
-        (
-            "/api/settings/pricing",
-            serde_json::json!({"ref_price_in": 1.0, "ref_price_out": 2.0}),
-        ),
-        (
-            "/api/settings/governor",
-            serde_json::json!({"enabled": false}),
-        ),
-    ] {
-        let (status, v) = post_json(&proxy, &alice, path, body).await;
-        assert_eq!(status, 403, "{path} should be admin-only: {v}");
-    }
-
-    // Removing / disabling someone else's NIM key is also forbidden.
-    let fp = api_config(&proxy, &root).await["nim_keys"][0]["fingerprint"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let (status, v) = post_json(
-        &proxy,
-        &alice,
-        "/api/settings/nim-keys",
-        serde_json::json!({"remove": fp}),
-    )
-    .await;
-    assert_eq!(status, 403, "{v}");
-    let (status, _) = post_json(
-        &proxy,
-        &alice,
-        "/api/settings/nim-keys",
-        serde_json::json!({"set": {"fingerprint": fp, "enabled": false}}),
-    )
-    .await;
-    assert_eq!(status, 403);
-}
-
-#[tokio::test]
-async fn superuser_is_undeletable_and_the_pool_floor_holds() {
-    let mock = start_mock().await;
-    let opts = support::StoreOpts {
-        nim_keys: vec![("only-key".into(), 40)],
-        ..Default::default()
-    };
-    let proxy = start_proxy_with(&mock.url, opts, &[]).await;
-    let root = support::login(&proxy).await;
-
-    let (status, v) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/users",
-        serde_json::json!({"remove": support::TEST_USER}),
-    )
-    .await;
-    assert_eq!(status, 403, "superuser must be undeletable: {v}");
-
-    // The superuser's last enabled key is the pool floor: neither removable
-    // nor disableable, and the config marks it guarded for the padlock UI.
-    let cfg = api_config(&proxy, &root).await;
-    assert_eq!(cfg["nim_keys"][0]["guarded"], true, "{cfg}");
-    let fp = cfg["nim_keys"][0]["fingerprint"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let (status, v) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/nim-keys",
-        serde_json::json!({"remove": &fp}),
-    )
-    .await;
-    assert_eq!(status, 400, "{v}");
-    let (status, v) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/nim-keys",
-        serde_json::json!({"set": {"fingerprint": &fp, "enabled": false}}),
-    )
-    .await;
-    assert_eq!(status, 400, "{v}");
-}
-
-#[tokio::test]
-async fn deleting_a_user_pulls_their_keys_and_kills_their_session() {
-    let mock = start_mock().await;
-    let opts = support::StoreOpts {
-        extra_users: vec![("alice".into(), "user".into())],
-        ..Default::default()
-    };
-    let proxy = start_proxy_with(&mock.url, opts, &[]).await;
-    let root = support::login(&proxy).await;
-    let alice = support::login_as(&proxy, "alice").await;
-
-    // Any role may contribute a key to the shared pool.
-    let (status, v) = post_json(
-        &proxy,
-        &alice,
-        "/api/settings/nim-keys",
-        serde_json::json!({"add": {"key": "alice-key", "rpm": 10}}),
-    )
-    .await;
-    assert_eq!(status, 200, "{v}");
-    assert_eq!(api_config(&proxy, &root).await["pool"]["enabled"], 4);
-
-    let (status, v) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/users",
-        serde_json::json!({"remove": "alice"}),
-    )
-    .await;
-    assert_eq!(status, 200, "{v}");
-    let cfg = api_config(&proxy, &root).await;
-    assert_eq!(
-        cfg["pool"]["enabled"], 3,
-        "alice's key left the pool: {cfg}"
-    );
-    assert_eq!(cfg["users"].as_array().unwrap().len(), 1);
-
-    // Her session dies on the next lookup.
-    let resp = client()
-        .get(proxy.url("/api/config"))
-        .header("cookie", &alice)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 401);
-}
-
-#[tokio::test]
-async fn client_key_lifecycle_mints_once_and_revokes() {
-    let mock = start_mock().await;
-    let opts = support::StoreOpts {
-        open: false, // keyed, no keys yet: /v1 rejects everyone
-        ..Default::default()
-    };
-    let proxy = start_proxy_with(&mock.url, opts, &[]).await;
-    let root = support::login(&proxy).await;
-
-    let (status, v) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/clients",
-        serde_json::json!({"add": {"name": "opencode"}}),
-    )
-    .await;
-    assert_eq!(status, 200, "{v}");
-    let secret = v["secret"].as_str().unwrap().to_owned();
-    assert!(secret.starts_with("npk_"), "{secret}");
-
-    // The minted secret works on /v1; the stored config never returns it.
-    let ok = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .bearer_auth(&secret)
-        .json(&chat_body("hi", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(ok.status(), 200);
-    let cfg = api_config(&proxy, &root).await;
-    assert_eq!(cfg["client_keys"][0]["name"], "opencode");
-    assert!(
-        !serde_json::to_string(&cfg).unwrap().contains(&secret),
-        "secret must never be served back"
-    );
-
-    // Revoke: the same bearer stops working on the next request.
-    let (status, _) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/clients",
-        serde_json::json!({"remove": "opencode"}),
-    )
-    .await;
-    assert_eq!(status, 200);
-    let denied = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .bearer_auth(&secret)
-        .json(&chat_body("hi", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(denied.status(), 401);
-
-    // Flipping to open mode admits keyless clients again (admin-only).
-    let (status, _) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/clients",
-        serde_json::json!({"mode": "open"}),
-    )
-    .await;
-    assert_eq!(status, 200);
-    let open = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("hi", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(open.status(), 200);
-}
-
 #[tokio::test]
 async fn rpm_raise_applies_to_the_live_pool_immediately() {
     let mock = start_mock().await;
@@ -2865,7 +2176,7 @@ async fn rpm_raise_applies_to_the_live_pool_immediately() {
         ..Default::default()
     };
     let proxy = start_proxy_with(&mock.url, opts, &[]).await;
-    let root = support::login(&proxy).await;
+    let root = session_cookie(&proxy).await;
 
     let first = client()
         .post(proxy.url("/v1/chat/completions"))
@@ -2905,71 +2216,12 @@ async fn rpm_raise_applies_to_the_live_pool_immediately() {
     assert_eq!(third.status(), 200, "raised rpm applies live");
     assert_eq!(mock.state.hit_count(), 2);
 }
-
-#[tokio::test]
-async fn password_change_requires_current_and_rotates_other_sessions() {
-    let mock = start_mock().await;
-    let proxy = start_proxy(&mock.url, &[]).await;
-    let session_a = support::login(&proxy).await;
-    let session_b = support::login(&proxy).await;
-
-    let (status, v) = post_json(
-        &proxy,
-        &session_a,
-        "/api/settings/account",
-        serde_json::json!({"current_password": "wrong", "new_password": "a-brand-new-pw"}),
-    )
-    .await;
-    assert_eq!(
-        status, 403,
-        "re-auth is required regardless of session: {v}"
-    );
-
-    let resp = client()
-        .post(proxy.url("/api/settings/account"))
-        .header("cookie", &session_a)
-        .json(&serde_json::json!({
-            "current_password": support::TEST_PASSWORD,
-            "new_password": "a-brand-new-pw",
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    // The change response re-mints THIS session; every other one dies.
-    let fresh = resp.headers()["set-cookie"]
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_owned();
-    let alive = client()
-        .get(proxy.url("/api/config"))
-        .header("cookie", &fresh)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(alive.status(), 200);
-    let dead = client()
-        .get(proxy.url("/api/config"))
-        .header("cookie", &session_b)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        dead.status(),
-        401,
-        "old sessions bind the old password hash"
-    );
-}
-
 #[tokio::test]
 async fn base_url_change_flushes_the_models_cache() {
     let mock_a = start_mock().await;
     let mock_b = start_mock().await;
     let proxy = start_proxy(&mock_a.url, &[]).await;
-    let root = support::login(&proxy).await;
+    let root = session_cookie(&proxy).await;
 
     // Prime the (10-minute-TTL) catalog cache from upstream A.
     client()
@@ -3011,56 +2263,14 @@ async fn base_url_change_flushes_the_models_cache() {
         "catalog refetches from the new upstream, not the stale cache"
     );
 }
-
 #[tokio::test]
-async fn admin_cannot_reset_or_takeover_the_superuser() {
-    let mock = start_mock().await;
-    let opts = support::StoreOpts {
-        extra_users: vec![("adm".into(), "admin".into())],
-        ..Default::default()
-    };
-    let proxy = start_proxy_with(&mock.url, opts, &[]).await;
-    let adm = support::login_as(&proxy, "adm").await;
-
-    // An admin resetting the superuser's password would be account takeover
-    // (the change kills the real superuser's sessions). Must be refused.
-    let (status, v) = post_json(
-        &proxy,
-        &adm,
-        "/api/settings/users",
-        serde_json::json!({"reset_password": {"username": support::TEST_USER, "new_password": "attacker-chosen-pw"}}),
-    )
-    .await;
-    assert_eq!(
-        status, 403,
-        "admin must not reset the superuser's password: {v}"
-    );
-
-    // The superuser can still log in with the original password afterwards.
-    let su = support::login(&proxy).await;
-    assert!(!su.is_empty());
-
-    // A normal reset of a peer admin still works.
-    let (status, v) = post_json(
-        &proxy,
-        &su,
-        "/api/settings/users",
-        serde_json::json!({"reset_password": {"username": "adm", "new_password": "brand-new-admin-pw"}}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "resetting a non-superuser must still work: {v}"
-    );
-}
-
-#[tokio::test]
-async fn authenticated_key_validation_ignores_caller_supplied_base_url() {
-    // The configured upstream is the mock; a caller-supplied base_url must be
-    // ignored so the endpoint can't be turned into an SSRF probe.
+async fn authenticated_key_validation_uses_only_the_configured_upstream() {
+    // The endpoint probes the configured upstream, never anything the caller
+    // supplies: an extra base_url field in the body is ignored, so the probe
+    // can't be pointed at internal hosts (defanged SSRF by construction).
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[]).await;
-    let root = support::login(&proxy).await;
+    let root = session_cookie(&proxy).await;
 
     let (status, v) = post_json(
         &proxy,
@@ -3078,35 +2288,6 @@ async fn authenticated_key_validation_ignores_caller_supplied_base_url() {
     );
     assert_eq!(v["models"], 1, "{v}");
 }
-
-#[tokio::test]
-async fn setup_key_validation_rejects_link_local_base_url() {
-    // Pre-auth setup probe must not be usable as an SSRF oracle against the
-    // cloud metadata endpoint; loopback/LAN upstreams stay allowed.
-    let mock = start_mock().await;
-    let proxy = support::start_proxy_fresh().await;
-
-    let bad = client()
-        .post(proxy.url("/setup/validate-key"))
-        .json(
-            &serde_json::json!({"key": "x", "base_url": "http://169.254.169.254/latest/meta-data"}),
-        )
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(bad.status(), 400, "link-local base_url must be rejected");
-
-    // A normal (loopback mock) upstream still validates fine.
-    let ok = client()
-        .post(proxy.url("/setup/validate-key"))
-        .json(&serde_json::json!({"key": "x", "base_url": mock.url}))
-        .send()
-        .await
-        .unwrap();
-    let v: serde_json::Value = ok.json().await.unwrap();
-    assert_eq!(v["ok"], true, "loopback upstream still probes: {v}");
-}
-
 /// Streaming requests hold their in-flight slot for the stream's whole
 /// lifetime — `max_inflight` caps total concurrent work, not just the
 /// buffered path (streaming is what agent harnesses actually send).
@@ -3157,57 +2338,6 @@ async fn streaming_requests_count_against_the_inflight_cap() {
     drop(hog);
 }
 
-/// The wizard can mint a first client key atomically with the claim, so a
-/// fresh keyed-mode proxy serves /v1 immediately — no Settings detour. The
-/// secret is returned exactly once and never stored in plaintext.
-#[tokio::test]
-async fn setup_can_mint_a_first_client_key() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_fresh().await;
-
-    let resp = client()
-        .post(proxy.url("/setup"))
-        .json(&serde_json::json!({
-            "username": "admin",
-            "password": "hunter2hunter2",
-            "base_url": mock.url,
-            "nim_keys": [{"key": "nvapi-key", "rpm": 40}],
-            "create_client_key": {"name": "default"},
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let v: serde_json::Value = resp.json().await.unwrap();
-    let secret = v["client_key"]["secret"].as_str().expect("minted secret");
-    assert!(secret.starts_with("npk_"), "{v}");
-    assert_eq!(v["client_key"]["name"], "default");
-
-    // The store holds only the digest, never the bearer token itself.
-    let store = std::fs::read_to_string(proxy.data_dir.join("config.json")).unwrap();
-    assert!(
-        !store.contains(secret),
-        "client secret must not be persisted in plaintext"
-    );
-
-    // The minted key opens /v1 right away; keyless calls still fail closed.
-    let ok = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .bearer_auth(secret)
-        .json(&chat_body("hi", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(ok.status(), 200, "minted key serves /v1 with no detour");
-    let no_key = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("hi", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(no_key.status(), 401, "keyed mode still fails closed");
-}
-
 // ---------- settings-endpoint coverage backfill ----------
 
 /// A DATA_DIR whose path is blocked by a regular file is a hard boot error.
@@ -3228,7 +2358,7 @@ async fn boot_refuses_an_unwritable_data_dir() {
 async fn governor_settings_reflect_and_persist() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[]).await;
-    let root = support::login(&proxy).await;
+    let root = session_cookie(&proxy).await;
 
     let (status, v) = post_json(
         &proxy,
@@ -3268,7 +2398,7 @@ async fn governor_settings_reflect_and_persist() {
     assert_eq!(status, 200);
 
     let proxy = restart(proxy, &[]).await;
-    let root = support::login(&proxy).await;
+    let root = session_cookie(&proxy).await;
     let cfg = api_config(&proxy, &root).await;
     assert_eq!(
         cfg["server"]["governor"]["enabled"], false,
@@ -3289,7 +2419,7 @@ async fn governor_settings_reflect_and_persist() {
 async fn pricing_and_history_settings_reflect_in_api_config() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[]).await;
-    let root = support::login(&proxy).await;
+    let root = session_cookie(&proxy).await;
 
     let (status, v) = post_json(
         &proxy,
@@ -3353,7 +2483,7 @@ async fn pricing_and_history_settings_reflect_in_api_config() {
 async fn limits_validation_rejects_bad_bounds_and_partial_bodies() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[]).await;
-    let root = support::login(&proxy).await;
+    let root = session_cookie(&proxy).await;
 
     let (status, v) = post_json(
         &proxy,
@@ -3363,8 +2493,6 @@ async fn limits_validation_rejects_bad_bounds_and_partial_bodies() {
             "max_wait_secs": 5, "heartbeat_secs": 10, "models_ttl_secs": 600,
             "stream_idle_secs": 300, "request_timeout_secs": 300,
             "max_inflight": 512, "strict_passthrough": false,
-            "backpressure_enabled": false,
-            "backpressure_queue_threshold_eta_secs": 20
         }),
     )
     .await;
@@ -3389,25 +2517,6 @@ async fn limits_validation_rejects_bad_bounds_and_partial_bodies() {
         422,
         "a partial limits body is rejected, not defaulted"
     );
-}
-
-/// The account endpoint enforces the same 10-character password floor the
-/// wizard and user-management do.
-#[tokio::test]
-async fn account_rejects_a_short_new_password() {
-    let mock = start_mock().await;
-    let proxy = start_proxy(&mock.url, &[]).await;
-    let root = support::login(&proxy).await;
-
-    let (status, v) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/account",
-        serde_json::json!({"current_password": support::TEST_PASSWORD, "new_password": "short"}),
-    )
-    .await;
-    assert_eq!(status, 400, "{v}");
-    assert_eq!(v["error"]["code"], "weak_password");
 }
 
 /// A stream whose upstream hangs must release its in-flight slot promptly
@@ -3478,112 +2587,22 @@ async fn disconnected_stream_releases_its_inflight_slot() {
 }
 
 // ===========================================================================
-// Coverage wave 2: setup edge cases, settings error/ownership legs, and the
-// auth handler surface (Basic scrape creds, login redirects, logout). These
-// drive previously-uncovered branches through the real HTTP surface.
+// Coverage: settings error legs and key validation driven through the real
+// HTTP surface.
 // ===========================================================================
-
-/// Two wizard claims race; the store mutex admits exactly one.
-#[tokio::test]
-async fn setup_double_claim_is_rejected_with_409() {
-    let proxy = start_proxy_fresh().await;
-    let body = serde_json::json!({
-        "username": "admin",
-        "password": "hunter2hunter2",
-        "base_url": "http://127.0.0.1:9999",
-        "nim_keys": [{"key": "nvapi-x", "rpm": 40}],
-    });
-    // Both requests pass the setup_required check before either finishes the
-    // 600k-iteration PBKDF2 hash, so the mutex arbitrates one winner.
-    let (a, b) = tokio::join!(
-        client().post(proxy.url("/setup")).json(&body).send(),
-        client().post(proxy.url("/setup")).json(&body).send(),
-    );
-    let mut statuses = [a.unwrap().status().as_u16(), b.unwrap().status().as_u16()];
-    statuses.sort_unstable();
-    assert_eq!(
-        statuses,
-        [200, 409],
-        "exactly one claim wins, the other 409s"
-    );
-}
-
-/// A lockout-recovery store (users hand-emptied) keeps orphan-owned client
-/// keys; claiming the proxy re-owns them to the new superuser.
-#[tokio::test]
-async fn setup_adopts_orphan_client_keys_on_claim() {
-    let mock = start_mock().await;
-    let dir = scratch_data_dir();
-    let fixture = serde_json::json!({
-        "version": 1,
-        "upstream": {
-            "base_url": mock.url,
-            "nim_keys": [{"key": "orphan-key", "owner": "ghost", "enabled": true, "rpm": 40}],
-        },
-        "client_auth": {
-            "mode": "keyed",
-            "keys": [{
-                "name": "orphan-client",
-                "secret_sha256": support::sha256_hex("orphan-secret"),
-                "owner": "ghost",
-            }],
-        },
-        "users": [],
-    });
-    std::fs::write(
-        dir.join("config.json"),
-        serde_json::to_string_pretty(&fixture).unwrap(),
-    )
-    .unwrap();
-
-    let proxy = start_proxy_in(dir, &[]).await;
-    let root = complete_setup(&proxy, "admin", support::TEST_PASSWORD, &mock.url, &[]).await;
-
-    // The orphan client key is re-owned by the new superuser...
-    let cfg = api_config(&proxy, &root).await;
-    assert_eq!(cfg["client_keys"][0]["owner"], "admin", "{cfg}");
-    // ...and its secret still authenticates on keyed /v1.
-    let r = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .bearer_auth("orphan-secret")
-        .json(&chat_body("hi", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 200, "adopted client key authenticates");
-}
-
-/// The pre-auth key probe shares the login throttle; hammering it trips 429.
-#[tokio::test]
-async fn setup_validate_key_throttles_after_repeated_probes() {
-    let proxy = start_proxy_fresh().await;
-    // A dead loopback fails fast (no real egress) but still burns throttle
-    // budget on each probe.
-    let body = serde_json::json!({"key": "x", "base_url": "http://127.0.0.1:1"});
-    let mut last = 0u16;
-    for _ in 0..12 {
-        last = client()
-            .post(proxy.url("/setup/validate-key"))
-            .json(&body)
-            .send()
-            .await
-            .unwrap()
-            .status()
-            .as_u16();
-    }
-    assert_eq!(last, 429, "the throttle trips after repeated failed probes");
-}
 
 /// A reachable upstream that 404s the models route is a key rejection, not a
 /// connection failure (probe_key's non-success branch).
 #[tokio::test]
 async fn key_probe_reports_upstream_rejection() {
     let mock = start_mock().await;
-    let proxy = start_proxy_fresh().await;
+    // Point the proxy's upstream at a bogus path: the mock's own router
+    // 404s /v1/models there, so the probe must read it as a key rejection
+    // (configured base URL, never a caller-supplied one).
+    let proxy = start_proxy(&format!("{}/bogus", mock.url), &[]).await;
     let resp = client()
-        .post(proxy.url("/setup/validate-key"))
-        // A bogus path prefix 404s on the mock's own router.
-        .json(&serde_json::json!({"key": "x", "base_url": format!("{}/bogus", mock.url)}))
+        .post(proxy.url("/api/settings/validate-key"))
+        .json(&serde_json::json!({"key": "x"}))
         .send()
         .await
         .unwrap();
@@ -3598,7 +2617,7 @@ async fn key_probe_reports_upstream_rejection() {
 #[tokio::test]
 async fn authenticated_key_validation_reports_unreachable_upstream() {
     let proxy = start_proxy_with("http://127.0.0.1:1", support::StoreOpts::default(), &[]).await;
-    let root = support::login(&proxy).await;
+    let root = session_cookie(&proxy).await;
     let (status, v) = post_json(
         &proxy,
         &root,
@@ -3617,7 +2636,7 @@ async fn authenticated_key_validation_reports_unreachable_upstream() {
 async fn nim_keys_reject_unknown_fingerprint_and_empty_action() {
     let mock = start_mock().await;
     let proxy = start_proxy_with(&mock.url, support::StoreOpts::default(), &[]).await;
-    let root = support::login(&proxy).await;
+    let root = session_cookie(&proxy).await;
     for body in [
         serde_json::json!({"remove": "deadbeef"}),
         serde_json::json!({"set": {"fingerprint": "deadbeef", "enabled": true}}),
@@ -3644,88 +2663,13 @@ async fn nim_keys_reject_unknown_fingerprint_and_empty_action() {
 
 /// Client-key endpoint: unknown name, bad mode, empty oneof, empty name on
 /// commit, and cross-owner revoke are all rejected with the right status.
-#[tokio::test]
-async fn clients_reject_unknown_bad_input_and_cross_owner_revoke() {
-    let mock = start_mock().await;
-    let opts = support::StoreOpts {
-        extra_users: vec![("alice".into(), "user".into())],
-        ..Default::default()
-    };
-    let proxy = start_proxy_with(&mock.url, opts, &[]).await;
-    let root = support::login(&proxy).await;
-    let alice = support::login_as(&proxy, "alice").await;
-
-    let (s, v) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/clients",
-        serde_json::json!({"remove": "nope"}),
-    )
-    .await;
-    assert_eq!(s, 400, "{v}");
-    assert!(
-        v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("no such client key"),
-        "{v}"
-    );
-
-    let (s, _) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/clients",
-        serde_json::json!({"mode": "bogus"}),
-    )
-    .await;
-    assert_eq!(s, 400, "bad mode rejected");
-    let (s, _) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/clients",
-        serde_json::json!({}),
-    )
-    .await;
-    assert_eq!(s, 400, "empty action rejected");
-    let (s, v) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/clients",
-        serde_json::json!({"add": {"name": ""}}),
-    )
-    .await;
-    assert_eq!(s, 400, "empty name rejected on commit: {v}");
-
-    // Root mints a key; alice may not revoke someone else's.
-    let (s, _) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/clients",
-        serde_json::json!({"add": {"name": "root-key"}}),
-    )
-    .await;
-    assert_eq!(s, 200);
-    let (s, v) = post_json(
-        &proxy,
-        &alice,
-        "/api/settings/clients",
-        serde_json::json!({"remove": "root-key"}),
-    )
-    .await;
-    assert_eq!(s, 403, "{v}");
-    assert!(
-        v["error"]["message"].as_str().unwrap().contains("your own"),
-        "{v}"
-    );
-}
-
 /// The upstream base_url is re-validated on write: a link-local target (SSRF /
 /// cloud-metadata) is refused.
 #[tokio::test]
 async fn upstream_rejects_link_local_base_url() {
     let mock = start_mock().await;
     let proxy = start_proxy_with(&mock.url, support::StoreOpts::default(), &[]).await;
-    let root = support::login(&proxy).await;
+    let root = session_cookie(&proxy).await;
     let (s, v) = post_json(
         &proxy,
         &root,
@@ -3741,277 +2685,6 @@ async fn upstream_rejects_link_local_base_url() {
             .contains("link-local"),
         "{v}"
     );
-}
-
-/// User management: weak-password rejection on add and reset, commit-error on a
-/// blank username, the add+hashing happy path, reset of an unknown user, and
-/// role changes (promote a user; the superuser's role is immutable).
-#[tokio::test]
-async fn users_add_reset_and_set_role_paths() {
-    let mock = start_mock().await;
-    let opts = support::StoreOpts {
-        extra_users: vec![
-            ("adm".into(), "admin".into()),
-            ("bob".into(), "user".into()),
-        ],
-        ..Default::default()
-    };
-    let proxy = start_proxy_with(&mock.url, opts, &[]).await;
-    let root = support::login(&proxy).await;
-
-    // Add: weak password rejected.
-    let (s, v) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/users",
-        serde_json::json!({"add": {"username": "eve", "password": "short", "role": "user"}}),
-    )
-    .await;
-    assert_eq!(s, 400, "{v}");
-    assert_eq!(v["error"]["code"], "weak_password", "{v}");
-    // Add: a username that trims to empty fails on commit.
-    let (s, _) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/users",
-        serde_json::json!({"add": {"username": "   ", "password": "long-enough-pw", "role": "user"}}),
-    )
-    .await;
-    assert_eq!(s, 400, "blank username rejected");
-    // Add: valid -> the new user can log in (exercises the hashing path).
-    // login_as always uses TEST_PASSWORD, so create eve with it.
-    let (s, v) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/users",
-        serde_json::json!({"add": {"username": "eve", "password": support::TEST_PASSWORD, "role": "user"}}),
-    )
-    .await;
-    assert_eq!(s, 200, "{v}");
-    let _ = support::login_as(&proxy, "eve").await;
-
-    // Reset: weak password and unknown user both rejected.
-    let (s, v) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/users",
-        serde_json::json!({"reset_password": {"username": "adm", "new_password": "short"}}),
-    )
-    .await;
-    assert_eq!(s, 400, "{v}");
-    assert_eq!(v["error"]["code"], "weak_password", "{v}");
-    let (s, v) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/users",
-        serde_json::json!({"reset_password": {"username": "ghost", "new_password": "long-enough-pw"}}),
-    )
-    .await;
-    assert_eq!(s, 400, "{v}");
-    assert!(
-        v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("no such user"),
-        "{v}"
-    );
-
-    // set_role: promote bob to admin (verified functionally), then confirm the
-    // superuser's role can't be changed.
-    let (s, v) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/users",
-        serde_json::json!({"set_role": {"username": "bob", "role": "admin"}}),
-    )
-    .await;
-    assert_eq!(s, 200, "{v}");
-    let bob = support::login_as(&proxy, "bob").await;
-    let (s, _) = post_json(
-        &proxy,
-        &bob,
-        "/api/settings/governor",
-        serde_json::json!({"enabled": true}),
-    )
-    .await;
-    assert_eq!(s, 200, "bob now has admin rights");
-    let (s, v) = post_json(
-        &proxy,
-        &root,
-        "/api/settings/users",
-        serde_json::json!({"set_role": {"username": support::TEST_USER, "role": "user"}}),
-    )
-    .await;
-    assert_eq!(s, 403, "{v}");
-    assert!(
-        v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("immutable"),
-        "{v}"
-    );
-}
-
-/// User-management input validation: invalid role and unknown-target legs on
-/// add / set_role / remove, plus the exactly-one-action rule.
-#[tokio::test]
-async fn users_reject_invalid_role_unknown_target_and_bad_action() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, support::StoreOpts::default(), &[]).await;
-    let root = support::login(&proxy).await;
-    for body in [
-        serde_json::json!({"add": {"username": "x", "password": "long-enough-pw", "role": "wizard"}}),
-        serde_json::json!({"remove": "ghost"}),
-        serde_json::json!({"set_role": {"username": "x", "role": "wizard"}}),
-        serde_json::json!({"set_role": {"username": "ghost", "role": "user"}}),
-        serde_json::json!({}),
-    ] {
-        let (s, v) = post_json(&proxy, &root, "/api/settings/users", body).await;
-        assert_eq!(s, 400, "{v}");
-    }
-}
-
-/// Scraper header auth: HTTP Basic works (a second identical call also drives
-/// the credential-memo fast path), while an unknown scheme, a wrong password,
-/// and a foreign cookie all 401.
-#[tokio::test]
-async fn scraper_header_auth_variants() {
-    let mock = start_mock().await;
-    let proxy = start_proxy(&mock.url, &[]).await;
-
-    for _ in 0..2 {
-        let r = client()
-            .get(proxy.url("/api/config"))
-            .basic_auth(support::TEST_USER, Some(support::TEST_PASSWORD))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 200, "HTTP Basic scrape credential");
-    }
-    let r = client()
-        .get(proxy.url("/api/config"))
-        .header("authorization", "Digest x")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 401, "unknown auth scheme");
-    let r = client()
-        .get(proxy.url("/api/config"))
-        .bearer_auth(format!("{}:wrong", support::TEST_USER))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 401, "wrong password");
-    let r = client()
-        .get(proxy.url("/api/config"))
-        .header("cookie", "foo=bar")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 401, "a foreign cookie is ignored");
-}
-
-/// Pre-setup, a non-HTML request to the operator surface answers 503
-/// setup_required rather than redirecting.
-#[tokio::test]
-async fn require_session_pre_setup_answers_setup_required_json() {
-    let proxy = start_proxy_fresh().await;
-    let r = client()
-        .get(proxy.url("/api/config"))
-        .header("accept", "application/json")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 503);
-    let v: serde_json::Value = r.json().await.unwrap();
-    assert_eq!(v["error"]["code"], "setup_required", "{v}");
-}
-
-/// GET /login redirects an already-authenticated user to the dashboard.
-#[tokio::test]
-async fn login_page_redirects_when_already_authenticated() {
-    let mock = start_mock().await;
-    let proxy = start_proxy(&mock.url, &[]).await;
-    let root = support::login(&proxy).await;
-    let r = no_redirect_client()
-        .get(proxy.url("/login"))
-        .header("cookie", &root)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 302);
-    assert_eq!(r.headers()["location"], "/");
-}
-
-/// POST /login before setup bounces to the wizard.
-#[tokio::test]
-async fn login_pre_setup_redirects_to_wizard() {
-    let proxy = start_proxy_fresh().await;
-    let r = no_redirect_client()
-        .post(proxy.url("/login"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body("username=x&password=yyyyyyyyyy")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 302);
-    assert_eq!(r.headers()["location"], "/setup");
-}
-
-/// An empty login body (both form fields absent) falls to the burner-hash path
-/// and still fails closed.
-#[tokio::test]
-async fn login_with_empty_body_fails_closed() {
-    let mock = start_mock().await;
-    let proxy = start_proxy(&mock.url, &[]).await;
-    let r = no_redirect_client()
-        .post(proxy.url("/login"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body("")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 401);
-}
-
-/// POST /logout clears the session cookie and redirects to the login page.
-#[tokio::test]
-async fn logout_clears_the_session_cookie() {
-    let mock = start_mock().await;
-    let proxy = start_proxy(&mock.url, &[]).await;
-    let root = support::login(&proxy).await;
-    let r = no_redirect_client()
-        .post(proxy.url("/logout"))
-        .header("cookie", &root)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 303);
-    assert_eq!(r.headers()["location"], "/login");
-    let set = r.headers()["set-cookie"].to_str().unwrap();
-    assert!(set.contains("nimproxy_session="), "{set}");
-    assert!(set.contains("Max-Age=0"), "{set}");
-}
-
-/// The wizard's strong-password gate passes, but a candidate that fails
-/// `validate()` at commit surfaces as `invalid_config` (not a panic/500).
-#[tokio::test]
-async fn setup_rejects_an_invalid_config_on_commit() {
-    let proxy = start_proxy_fresh().await;
-    let resp = client()
-        .post(proxy.url("/setup"))
-        .json(&serde_json::json!({
-            "username": "bad user!", // fails the username charset check in validate()
-            "password": "hunter2hunter2",
-            "base_url": "http://127.0.0.1:9999",
-            "nim_keys": [{"key": "k", "rpm": 40}],
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 400);
-    let v: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(v["error"]["code"], "invalid_config", "{v}");
 }
 
 /// An empty DATA_DIR is a fatal misconfiguration — the store home must be a
@@ -4054,20 +2727,15 @@ async fn health_probe_flag_reports_liveness() {
 async fn queue_lists_inflight_requests_and_terminates_them_with_code_91() {
     use futures_util::StreamExt;
     let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, keyed("alice", "sekrit"), &[]).await;
+    let proxy = start_proxy(&mock.url, &[]).await;
     mock.state.push(Behavior::ActiveStream(50));
-    let cookie = login(&proxy).await;
-
-    // Unauthenticated /api/queue is gated like every other /api route.
-    let unauth = client().get(proxy.url("/api/queue")).send().await.unwrap();
-    assert_eq!(unauth.status(), 401);
+    let cookie = session_cookie(&proxy).await;
 
     // Start a stream that never ends on its own; a background task drains it
     // into a shared buffer so the proxy's response channel never fills (that
     // mirrors a harness actually reading its stream).
     let stream = client()
         .post(proxy.url("/v1/chat/completions"))
-        .bearer_auth("sekrit")
         .json(&chat_body("queue probe", true))
         .send()
         .await
@@ -4101,7 +2769,7 @@ async fn queue_lists_inflight_requests_and_terminates_them_with_code_91() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    assert_eq!(entry["client"], "alice");
+    assert_eq!(entry["client"], "local");
     assert_eq!(entry["model"], "mock/model-a");
     assert_eq!(entry["path"], "/v1/chat/completions");
     assert!(entry["phase"].is_string(), "{entry}");
@@ -4163,62 +2831,14 @@ async fn queue_lists_inflight_requests_and_terminates_them_with_code_91() {
     assert_eq!(r.status(), 404);
 }
 
-/// The queue surface is admin-only: plain users are denied server-side, and
-/// `/api/dashboard/now` reports the role so the sidebar entry can be hidden.
-#[tokio::test]
-async fn queue_is_admin_only_and_now_reports_the_role() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_with(
-        &mock.url,
-        StoreOpts {
-            extra_users: vec![("carol".into(), "user".into())],
-            ..keyed("alice", "sekrit")
-        },
-        &[],
-    )
-    .await;
-
-    let user_cookie = login_as(&proxy, "carol").await;
-    let get = client()
-        .get(proxy.url("/api/queue"))
-        .header("cookie", &user_cookie)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(get.status(), 403, "plain users must not see the queue");
-    let term = client()
-        .post(proxy.url("/api/queue/terminate"))
-        .header("cookie", &user_cookie)
-        .json(&serde_json::json!({ "id": 1 }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(term.status(), 403, "plain users must not terminate");
-
-    let admin_cookie = login(&proxy).await;
-    let get = client()
-        .get(proxy.url("/api/queue"))
-        .header("cookie", &admin_cookie)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(get.status(), 200);
-
-    assert_eq!(dashboard_now(&proxy, &user_cookie).await["role"], "user");
-    assert_eq!(
-        dashboard_now(&proxy, &admin_cookie).await["role"],
-        "superuser"
-    );
-}
-
 /// A buffered (non-streaming) request killed while waiting on upstream
 /// headers answers the client with a JSON error: HTTP 400, code -91.
 #[tokio::test]
 async fn queue_terminates_buffered_requests_with_a_json_91() {
     let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, keyed("alice", "sekrit"), &[]).await;
+    let proxy = start_proxy_with(&mock.url, StoreOpts::default(), &[]).await;
     mock.state.push(Behavior::DelayHeaders(30_000));
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
 
     // The buffered request is parked waiting for headers (30s).
     let url = proxy.url("/v1/chat/completions");
@@ -4283,14 +2903,14 @@ async fn queue_terminates_a_request_still_waiting_for_a_slot() {
         StoreOpts {
             nim_keys: vec![("test-key-0".into(), 1)],
             heartbeat_secs: 1,
-            ..keyed("alice", "sekrit")
+            ..StoreOpts::default()
         },
         &[],
     )
     .await;
     mock.state.push(Behavior::ActiveStream(500));
     mock.state.push(Behavior::Ok);
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
 
     // Occupy the single lane with a stream that never ends. The holder and
     // the waiter are both "alice"; the waiter sits in phase "waiting_slot".
@@ -4382,7 +3002,7 @@ async fn queue_reports_waiting_permit_phase() {
     use futures_util::StreamExt;
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[]).await;
-    let root = support::login(&proxy).await;
+    let root = session_cookie(&proxy).await;
 
     // Pin the model's concurrency cap to 1: the second request must then wait
     // on the governor gate (phase waiting_permit), not the RPM queue.
@@ -4487,19 +3107,16 @@ async fn queue_reports_waiting_permit_phase() {
     }
 }
 
-/// The dispatch policy is configurable and observable: an admin flips the
-/// policy through /api/settings/dispatch, /api/config reports it back, the
-/// queue surface names it, and alongside /metrics the dispatcher exposes the
+/// The dispatch policy is configurable and observable: flipping the policy
+/// through /api/settings/dispatch, /api/config reports it back, the queue
+/// surface names it, and alongside /metrics the dispatcher exposes the
 /// live-policy gauge — all while requests keep flowing (a store switch that
 /// wedged the dispatcher would hang every request).
 #[tokio::test]
 async fn dispatch_policy_settings_round_trip_and_live_swaps() {
     let mock = start_mock().await;
-    // A plain user must not be able to change the scheduling policy.
-    let mut opts = StoreOpts::default();
-    opts.extra_users.push(("peon".into(), "user".into()));
-    let proxy = start_proxy_with(&mock.url, opts, &[]).await;
-    let cookie = login(&proxy).await;
+    let proxy = start_proxy(&mock.url, &[]).await;
+    let cookie = session_cookie(&proxy).await;
 
     // Defaults: FIFO both in the store and in the queue view.
     let cfg: serde_json::Value = client()
@@ -4512,8 +3129,6 @@ async fn dispatch_policy_settings_round_trip_and_live_swaps() {
         .await
         .unwrap();
     assert_eq!(cfg["server"]["dispatch"]["policy"], "fifo");
-    assert_eq!(cfg["server"]["dispatch"]["fair_aging_secs"], 60);
-    assert!(cfg["server"]["dispatch"]["fair_weights"].is_object());
     let q: serde_json::Value = client()
         .get(proxy.url("/api/queue"))
         .header("cookie", &cookie)
@@ -4525,26 +3140,11 @@ async fn dispatch_policy_settings_round_trip_and_live_swaps() {
         .unwrap();
     assert_eq!(q["dispatch_policy"], "fifo");
 
-    // Non-admins cannot touch the policy.
-    let denied = client()
-        .post(proxy.url("/api/settings/dispatch"))
-        .header("cookie", &login_as(&proxy, "peon").await)
-        .json(&serde_json::json!({ "policy": "fair" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(denied.status(), 403);
-
-    // Flip to Fair with an aging bound and a per-client weight; keep the
-    // proxy serving requests across the swap.
+    // Flip to EDF; keep the proxy serving requests across the swap.
     let r = client()
         .post(proxy.url("/api/settings/dispatch"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({
-            "policy": "fair",
-            "fair_aging_secs": 5,
-            "set_weight": ["opencode", 3],
-        }))
+        .json(&serde_json::json!({ "policy": "edf" }))
         .send()
         .await
         .unwrap();
@@ -4559,9 +3159,7 @@ async fn dispatch_policy_settings_round_trip_and_live_swaps() {
         .json()
         .await
         .unwrap();
-    assert_eq!(cfg["server"]["dispatch"]["policy"], "fair");
-    assert_eq!(cfg["server"]["dispatch"]["fair_aging_secs"], 5);
-    assert_eq!(cfg["server"]["dispatch"]["fair_weights"]["opencode"], 3);
+    assert_eq!(cfg["server"]["dispatch"]["policy"], "edf");
 
     // The queue view now names the live policy.
     let q: serde_json::Value = client()
@@ -4573,33 +3171,10 @@ async fn dispatch_policy_settings_round_trip_and_live_swaps() {
         .json()
         .await
         .unwrap();
-    assert_eq!(q["dispatch_policy"], "fair");
+    assert_eq!(q["dispatch_policy"], "edf");
 
-    // Requests still flow end-to-end under Fair.
+    // Requests still flow end-to-end under EDF.
     send_successful_chats(&proxy, 2).await;
-
-    // Removing the weight override round-trips too.
-    let r = client()
-        .post(proxy.url("/api/settings/dispatch"))
-        .header("cookie", &cookie)
-        .json(&serde_json::json!({ "remove_weight": "opencode" }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 200);
-    let cfg: serde_json::Value = client()
-        .get(proxy.url("/api/config"))
-        .header("cookie", &cookie)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        cfg["server"]["dispatch"]["fair_weights"]["opencode"],
-        serde_json::Value::Null
-    );
 
     // A bogus policy is a client error, not a half-applied state.
     let bad = client()
@@ -4615,7 +3190,7 @@ async fn dispatch_policy_settings_round_trip_and_live_swaps() {
     let proxy = restart(proxy, &[]).await;
     let q: serde_json::Value = client()
         .get(proxy.url("/api/queue"))
-        .header("cookie", &login(&proxy).await)
+        .header("cookie", &session_cookie(&proxy).await)
         .send()
         .await
         .unwrap()
@@ -4623,7 +3198,7 @@ async fn dispatch_policy_settings_round_trip_and_live_swaps() {
         .await
         .unwrap();
     assert_eq!(
-        q["dispatch_policy"], "fair",
+        q["dispatch_policy"], "edf",
         "policy persists across restart"
     );
 }
@@ -4637,7 +3212,7 @@ async fn dispatch_policy_settings_round_trip_and_live_swaps() {
 async fn edf_deadline_bounds_the_queue_wait() {
     let mock = start_mock().await;
     let proxy = start_proxy(&mock.url, &[]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
     let r = client()
         .post(proxy.url("/api/settings/dispatch"))
         .header("cookie", &cookie)
@@ -4697,7 +3272,7 @@ async fn rate_windows_survive_a_restart() {
             nim_keys: vec![("only-key".into(), 2)],
             max_wait_secs: 2,
             heartbeat_secs: 1,
-            ..keyed("alice", "sekrit")
+            ..StoreOpts::default()
         },
         envs,
     )
@@ -4718,7 +3293,7 @@ async fn rate_windows_survive_a_restart() {
 
     // Restart the same DATA_DIR; the window rides over in ratestate.jsonl.
     let proxy = restart(proxy, envs).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
     let now: serde_json::Value = client()
         .get(proxy.url("/api/dashboard/now"))
         .header("cookie", &cookie)
@@ -4764,7 +3339,7 @@ async fn ramp_slows_traffic_after_a_quick_restart() {
             nim_keys: vec![("only-key".into(), 20)],
             max_wait_secs: 2,
             heartbeat_secs: 1,
-            ..keyed("alice", "sekrit")
+            ..StoreOpts::default()
         },
         cold_envs,
     )
@@ -4795,7 +3370,7 @@ async fn ramp_slows_traffic_after_a_quick_restart() {
         text.contains("nimproxy_ramp_active 1"),
         "ramp gauge on after restart: {text}"
     );
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
     let now: serde_json::Value = client()
         .get(proxy.url("/api/dashboard/now"))
         .header("cookie", &cookie)
@@ -4836,194 +3411,6 @@ async fn ramp_slows_traffic_after_a_quick_restart() {
     );
     assert_eq!(limited, 6, "surplus requests shed while the ramp is on");
     assert_eq!(mock.state.hit_count(), 5, "upstream saw 3 cold + 2 ramped");
-}
-
-// --- Graduated backpressure tests ---
-
-/// Helper: backpressure fixture with 1 key at 1 RPM, backpressure on, 10s
-/// threshold. Saturating the lane forces ETA = window ~61s >> 10s threshold.
-fn backpressure_opts() -> StoreOpts {
-    StoreOpts {
-        nim_keys: vec![("test-key-0".into(), 1)],
-        max_wait_secs: 120,
-        heartbeat_secs: 1,
-        backpressure_enabled: true,
-        backpressure_queue_threshold_eta_secs: 10,
-        ..Default::default()
-    }
-}
-
-#[tokio::test]
-async fn backpressure_rejects_with_503_and_retry_after_when_eta_exceeds_threshold() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, backpressure_opts(), &[]).await;
-
-    // Occupy the single lane so ETA >> threshold.
-    let hog = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("hog", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(hog.status(), 200);
-
-    // Next request should be rejected by backpressure (no deadline).
-    let resp = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("burst", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 503);
-    let retry_after = resp
-        .headers()
-        .get(header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
-    assert!(
-        retry_after.is_some() && retry_after.unwrap() >= 10,
-        "Retry-After should be >= 10s, got {:?}",
-        retry_after
-    );
-    let v: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(v["error"]["code"], "backpressure");
-
-    let metrics = metrics(&proxy).await;
-    assert!(metrics.contains("nimproxy_backpressure_total{kind=\"reject\"} 1"));
-}
-
-#[tokio::test]
-async fn backpressure_does_not_affect_requests_with_explicit_deadline() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, backpressure_opts(), &[]).await;
-
-    // Occupy the single lane.
-    let hog = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("hog", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(hog.status(), 200);
-
-    // A request with X-Nim-Proxy-Deadline-Ms must bypass backpressure
-    // and queue normally (the deadline will eventually expire).
-    let resp = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .header("X-Nim-Proxy-Deadline-Ms", "5000")
-        .json(&chat_body("deadline", false))
-        .send()
-        .await
-        .unwrap();
-    // Must NOT be 503 — the deadline request is exempt.
-    assert_ne!(resp.status(), 503);
-    // It will either queue and eventually get 504 (deadline expires) or
-    // possibly get through if the hog finishes fast enough. Either is fine
-    // as long as it's not a backpressure reject.
-    assert!(
-        resp.status() == 504 || resp.status() == 200,
-        "expected 504 or 200, got {}",
-        resp.status()
-    );
-}
-
-#[tokio::test]
-async fn backpressure_streaming_eta_header_appears_when_eta_below_threshold() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, backpressure_opts(), &[]).await;
-
-    // Free lane → ETA = 0, well below threshold → streaming response gets
-    // X-Nim-Proxy-Eta header.
-    let resp = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("stream-test", true))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let eta = resp
-        .headers()
-        .get("X-Nim-Proxy-Eta")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok());
-    assert_eq!(
-        eta,
-        Some(0),
-        "X-Nim-Proxy-Eta should be 0 when lane is free"
-    );
-    let body = read_sse(resp).await;
-    assert!(body.contains("hello"), "stream body should be relayed");
-
-    let metrics = metrics(&proxy).await;
-    assert!(metrics.contains(r#"nimproxy_backpressure_total{kind="eta"}"#));
-}
-
-#[tokio::test]
-async fn backpressure_disabled_falls_back_to_normal_behavior() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_with(
-        &mock.url,
-        StoreOpts {
-            nim_keys: vec![("test-key-0".into(), 1)],
-            max_wait_secs: 5,
-            heartbeat_secs: 1,
-            backpressure_enabled: false,
-            ..Default::default()
-        },
-        &[],
-    )
-    .await;
-
-    // Occupy the single lane.
-    let hog = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("hog", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(hog.status(), 200);
-
-    // Backpressure is off → request queues normally and gets 504 quickly
-    // (max_wait = 5s, far below the 61s window).
-    let resp = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("queued", false))
-        .send()
-        .await
-        .unwrap();
-    // Must NOT be 503 (backpressure is disabled).
-    assert_ne!(resp.status(), 503);
-    assert_eq!(resp.status(), 504, "saturated lane should give 504");
-
-    let metrics = metrics(&proxy).await;
-    // No backpressure metrics should appear.
-    assert!(!metrics.contains("nimproxy_backpressure_total"));
-}
-
-#[tokio::test]
-async fn backpressure_rejects_streaming_request_before_200_commit() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, backpressure_opts(), &[]).await;
-
-    // Occupy the single lane.
-    let hog = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("hog", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(hog.status(), 200);
-
-    // Streaming request with no deadline → should get 503 before SSE commit.
-    let resp = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("stream-reject", true))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 503);
-    let v: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(v["error"]["code"], "backpressure");
 }
 
 // ---------------------------------------------------------------------------
@@ -5136,225 +3523,11 @@ async fn failover_health_reported_in_dashboard_now() {
         ..Default::default()
     };
     let proxy = start_proxy_with(&mock.url, opts, &[]).await;
-    let cookie = login(&proxy).await;
+    let cookie = session_cookie(&proxy).await;
 
     let now = dashboard_now(&proxy, &cookie).await;
     let health = now["upstream_health"].as_array().unwrap();
     assert_eq!(health.len(), 2, "two endpoints reported");
     assert!(health[0]["alive"].as_bool().unwrap());
     assert!(health[1]["alive"].as_bool().unwrap());
-}
-
-// ---------------------------------------------------------------------------
-// Response cache (task 14): idempotent non-streaming requests are served from
-// memory, skipping the rate-limit queue and the upstream call.
-// ---------------------------------------------------------------------------
-
-/// A fixture with the response cache enabled (TTL 60s).
-fn cached() -> StoreOpts {
-    StoreOpts {
-        cache_ttl_secs: 60,
-        cache_max_entries: 1024,
-        ..Default::default()
-    }
-}
-
-#[tokio::test]
-async fn cache_serves_the_second_identical_request() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, cached(), &[]).await;
-
-    for _ in 0..2 {
-        let r = client()
-            .post(proxy.url("/v1/chat/completions"))
-            .json(&chat_body("same", false))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 200);
-    }
-    // The second request is a cache hit: only one upstream call happened.
-    assert_eq!(
-        mock.state.hit_count(),
-        1,
-        "second request must be served from cache"
-    );
-
-    // The cached body is byte-identical to the upstream response.
-    let r1 = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("same", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r1.status(), 200);
-    assert_eq!(mock.state.hit_count(), 1, "still no further upstream call");
-}
-
-#[tokio::test]
-async fn cache_misses_on_different_bodies() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, cached(), &[]).await;
-
-    for i in 0..3 {
-        let r = client()
-            .post(proxy.url("/v1/chat/completions"))
-            .json(&chat_body(&format!("distinct {i}"), false))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 200);
-    }
-    // All three are distinct bodies -> no cache hits.
-    assert_eq!(mock.state.hit_count(), 3);
-}
-
-#[tokio::test]
-async fn cache_disabled_sends_every_request_upstream() {
-    let mock = start_mock().await;
-    // cache_ttl_secs defaults to 0 (disabled) in the test harness.
-    let proxy = start_proxy_with(&mock.url, StoreOpts::default(), &[]).await;
-
-    for _ in 0..2 {
-        let r = client()
-            .post(proxy.url("/v1/chat/completions"))
-            .json(&chat_body("same", false))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 200);
-    }
-    assert_eq!(
-        mock.state.hit_count(),
-        2,
-        "cache disabled -> both go upstream"
-    );
-}
-
-#[tokio::test]
-async fn cache_expires_after_ttl() {
-    let mock = start_mock().await;
-    let opts = StoreOpts {
-        cache_ttl_secs: 1,
-        ..Default::default()
-    };
-    let proxy = start_proxy_with(&mock.url, opts, &[]).await;
-
-    let _ = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("same", false))
-        .send()
-        .await
-        .unwrap();
-
-    // Wait past the TTL so the entry is evicted.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-
-    let _ = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("same", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        mock.state.hit_count(),
-        2,
-        "expired entry -> fresh upstream call"
-    );
-}
-
-#[tokio::test]
-async fn cache_skips_streaming_requests() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, cached(), &[]).await;
-
-    for _ in 0..2 {
-        let r = client()
-            .post(proxy.url("/v1/chat/completions"))
-            .json(&chat_body("same", true))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 200);
-        let _ = read_sse(r).await;
-    }
-    // Streaming requests are never cached.
-    assert_eq!(mock.state.hit_count(), 2);
-}
-
-#[tokio::test]
-async fn cache_skips_deadline_requests() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, cached(), &[]).await;
-
-    for _ in 0..2 {
-        let r = client()
-            .post(proxy.url("/v1/chat/completions"))
-            .header("X-Nim-Proxy-Deadline-Ms", "60000")
-            .json(&chat_body("same", false))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 200);
-    }
-    // Deadline requests imply one-shot semantics: never cached.
-    assert_eq!(mock.state.hit_count(), 2);
-}
-
-#[tokio::test]
-async fn cache_hits_show_in_metrics() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, cached(), &[]).await;
-
-    for _ in 0..2 {
-        let _ = client()
-            .post(proxy.url("/v1/chat/completions"))
-            .json(&chat_body("same", false))
-            .send()
-            .await
-            .unwrap();
-    }
-    let m = metrics(&proxy).await;
-    assert!(
-        m.contains("nimproxy_cache_hits_total"),
-        "hit counter present:\n{m}"
-    );
-    assert!(
-        m.contains("nimproxy_cache_misses_total"),
-        "miss counter present:\n{m}"
-    );
-    assert!(
-        m.contains("nimproxy_cache_entries"),
-        "entries gauge present:\n{m}"
-    );
-}
-
-#[tokio::test]
-async fn cache_does_not_store_upstream_errors() {
-    let mock = start_mock().await;
-    let proxy = start_proxy_with(&mock.url, cached(), &[]).await;
-
-    // First request: upstream answers a non-retryable 400 (never cached).
-    mock.state.push(Behavior::BadRequest);
-    let r = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("same", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 400);
-
-    // Second identical request goes upstream again (400 was not cached).
-    let r2 = client()
-        .post(proxy.url("/v1/chat/completions"))
-        .json(&chat_body("same", false))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r2.status(), 200);
-    assert_eq!(
-        mock.state.hit_count(),
-        2,
-        "a non-2xx response must not be cached"
-    );
 }

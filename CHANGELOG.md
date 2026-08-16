@@ -35,18 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `per_lane`, `window_fill`, and `window_capacity` fields.
   See [todo/10-capacity-now-window-fill.md](todo/10-capacity-now-window-fill.md).
 
-- **Capacity what-if simulator**: the Capacity tab can now answer "what if I
-  add keys / remove clients / widen the model gate?" with a pure-front-end
-  simulator. Sliders (keys, rpm per key, client request rate, model concurrency
-  cap, service time) are seeded from a new session-gated
-  `GET /api/dashboard/capacity-model` endpoint that aggregates the last hour of
-  existing observations — per-key budgets and calibration, per-client request
-  shape, per-model governor state, and histogram quantiles (queue wait, TTFT,
-  upstream time). The JS model reports projected throughput, the bottleneck
-  (key window / model gate / client rate), utilization, and an approximate
-  M/M/1 avg/P95 queue delay — clearly labeled a trend estimate, not a promise.
-  No new stored fields, no request content, no admin-only check (any user who
-  can see Capacity can use it).
 - **Multi-upstream failover**: the proxy now supports an *ordered* list of
   upstream endpoints instead of a single fixed base URL. The primary is
   preferred while healthy; when it fails (connect error, repeated 5xx, or a

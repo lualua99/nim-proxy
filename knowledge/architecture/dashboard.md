@@ -209,3 +209,13 @@ The typed history adapter preserves that rule for labels received from both
 dashboard endpoints, and scope/status text uses `textContent`. No range,
 current, Settings, hover, or sort path introduces an unescaped sink. See
 [input-sanitizing-and-xss](../decisions/input-sanitizing-and-xss.md).
+
+## v0.7.0 — session gate and auth tabs removed
+
+The single-operator build drops the `require_session` middleware (the dashboard
+serves without a login), the role badge/footer `auth` readout, the security
+"401 · failed logins" rows, and the Settings **Users** and **Account** sub-tabs,
+their client-key minting, and the open/keyed mode toggle. Settings keeps **NIM
+keys** and **Server**; the sidebar Queue entry is always visible. Every metric
+label is now `local` (single client row). The `esc()`/CSP invariant is
+unchanged. See [single-user-local-build](../decisions/single-user-local-build.md).

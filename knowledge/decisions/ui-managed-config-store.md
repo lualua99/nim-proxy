@@ -162,3 +162,14 @@ self-hosted NIM are real upstreams (`config::check_base_url`).
   mode, which affects **only `/v1`** — every dashboard/observability surface
   always requires a logged-in session. See the
   [auth-posture amendment](auth-posture-and-dashboard-password.md).
+
+## Amendment (v0.7.0 — single-operator local build)
+
+The store is unchanged in spirit (UI-editable `config.json`, atomic + 0600,
+boot-read), but its *contents* lost the whole user plane: no `users`/`roles`,
+no `client_auth` mode/keys, no `NimKey.owner`, no wizard, and no `setup_required`
+(boot starts with defaults when the store is absent). The settings handlers are
+no longer session/role-gated; `/api/config` returns the full server section to
+whoever can reach it. Validation keeps the bounds, URL checks, and per-key
+rulebook but drops ownership and the pool-floor invariant. See
+[single-user-local-build](single-user-local-build.md).
