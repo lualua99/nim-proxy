@@ -954,3 +954,15 @@ Notable facts captured at ingest time:
   before smoothing to a trailing-60s average → noted in [dashboard](architecture/dashboard.md).
 - The `/v1/models` schema research killed the idea of API-sourced model
   descriptions; cards enrich from the id namespace instead.
+
+## [2026-08-18] ingest — prepare v0.7.0 feature release
+
+- `Cargo.toml` / `Cargo.lock`: bumped `version` `0.6.5` → `0.7.0` (feature
+  release: response cache, realtime SSE dashboard push, multi-upstream
+  failover, graduated backpressure, and earlier queue/catalog/calibration
+  work accumulated under Unreleased).
+- `CHANGELOG.md`: promoted `[Unreleased]` to `[0.7.0] - 2026-08-18`, left a
+  fresh empty `[Unreleased]`, and moved the footer compare link from
+  `v0.6.5...HEAD` to `v0.7.0...HEAD` (+ added the `[0.7.0]` link).
+- `SECURITY.md`: supported-versions table and patch-release policy moved from
+  `0.6.x` to `0.7.x` per the release runbook.
