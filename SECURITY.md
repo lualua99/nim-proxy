@@ -6,13 +6,13 @@ We take its security posture seriously and welcome private reports.
 
 ## Supported versions
 
-Security fixes land on the latest `0.6.x` release. Older minors are not
-patched — upgrade to the newest `0.6.x` tag.
+Security fixes land on the latest `0.7.x` release. Older minors are not
+patched — upgrade to the newest `0.7.x` tag.
 
 | Version | Supported          |
 |---------|--------------------|
-| 0.6.x   | :white_check_mark: |
-| < 0.6   | :x:                |
+| 0.7.x   | :white_check_mark: |
+| < 0.7   | :x:                |
 
 ## Reporting a vulnerability
 
@@ -35,7 +35,7 @@ This is a small, volunteer-maintained project. We aim to:
 
 - **Acknowledge** your report within 3 business days.
 - **Triage** and confirm (or explain why it's out of scope) within 7 days.
-- **Fix** confirmed vulnerabilities in a `0.6.x` patch release and credit you in
+- **Fix** confirmed vulnerabilities in a `0.7.x` patch release and credit you in
   the advisory (unless you prefer to stay anonymous).
 
 Please give us a reasonable window to ship a fix before any public disclosure.
